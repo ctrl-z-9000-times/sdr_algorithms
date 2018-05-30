@@ -42,10 +42,10 @@ class TemporalMemory:
         assert(isinstance(context_sdr, SDR) or context_sdr is None)
         self.columns             = column_sdr
         self.context_sdr         = context_sdr
-        self.cells_per_column    = int(round(cells_per_column))
+        self.cells_per_column    = cells_per_column
         if self.cells_per_column < 1:
             raise ValueError("Cannot create TemporalMemory with cells_per_column < 1.")
-        self.segments_per_cell   = int(round(segments_per_cell))
+        self.segments_per_cell   = segments_per_cell
         assert(self.segments_per_cell > 0)
         self.active              = SDR((self.columns.size, self.cells_per_column),
                                         activation_frequency_alpha = 1/1000,)
@@ -53,11 +53,13 @@ class TemporalMemory:
         self.anomaly_alpha       = anomaly_alpha
         self.mean_anomaly        = 1.0
 
-        if context_sdr is None:
-            context_sdr = self.active
+        if self.context_sdr is not None:
+            all_context_sdr = (self.active.size + self.context_sdr.size,)
+        else:
+            all_context_sdr = self.active
 
-        self.synapses_per_segment = int(round(synapses_per_segment))
-        self.add_synapses         = int(round(add_synapses))
+        self.synapses_per_segment = synapses_per_segment
+        self.add_synapses         = add_synapses
         self.predictive_threshold = predictive_threshold
         self.learning_threshold   = learning_threshold
         self.mispredict_dec       = mispredict_dec
@@ -66,7 +68,7 @@ class TemporalMemory:
         self.predicted_boost      = predicted_boost
 
         self.synapses = SynapseManager(
-            input_sdr         = SDR(context_sdr),
+            input_sdr         = SDR(all_context_sdr),
             output_sdr        = SDR((self.columns.size, self.cells_per_column, self.segments_per_cell)),
             radii             = None,
             init_dist         = init_dist,
@@ -74,6 +76,7 @@ class TemporalMemory:
             permanence_inc    = permanence_inc,
             permanence_dec    = permanence_dec,)
 
+        self.age = 0
         self.reset()
 
     def reset(self):
@@ -92,9 +95,12 @@ class TemporalMemory:
         ########################################################################
         # PHASE 1:  Make predictions based on the previous timestep.
         ########################################################################
-        if context_sdr is None:
-            context_sdr = self.active
-        excitement, potential    = self.synapses.compute(input_sdr=context_sdr)
+        if self.context_sdr is not None:
+            self.context_sdr.assign(context_sdr)
+            self.synapses.input_sdr.assign_flat_concatenate((self.active, self.context_sdr))
+        else:
+            self.synapses.input_sdr.assign(self.active)
+        excitement, potential    = self.synapses.compute()
         self.excitement          = excitement
         self.predictive_segments = self.excitement >= self.predictive_threshold
         self.predictions         = np.sum(self.predictive_segments, axis=2)
@@ -142,17 +148,28 @@ class TemporalMemory:
 
         # Set the inputs to the previous winner cells.  Grow synapses from these
         # cells and reinforce synapses from them.
-        if context_learning_sdr is None:
-            prev_ctx_learning = self.learning
+        if self.context_sdr is not None:
+            self.synapses.input_sdr.assign_flat_concatenate((self.learning, context_learning_sdr))
         else:
-            1/0 # Unimplemented.
-        self.synapses.input_sdr.assign(prev_ctx_learning)
+            self.synapses.input_sdr.assign(self.learning)
 
         self._learn_predicted(predicted_active)
         bursting_learning = self._learn_bursting(bursting_columns)
         self._learn_mispredicted(columns)
 
         self.learning.index = tuple(np.concatenate([predicted_active, bursting_learning], axis=1))
+
+        # Remove zero permanence synapses periodically, not every cycle.
+        mean_initial_permanence = self.synapses.init_dist[0]
+        time_to_zero = mean_initial_permanence / self.synapses.permanence_dec
+        remove_zero_perm_syns_period = int(100 * time_to_zero)
+        if self.age % remove_zero_perm_syns_period == remove_zero_perm_syns_period-1:
+            # import time
+            # start_time = time.time()
+            self.synapses.remove_zero_permanence_synapses()
+            # print("Removed zero permanence synapses, time:", time.time() - start_time, 'seconds')
+
+        self.age += 1
 
     def _learn_predicted(self, predicted_active):
         # Apply Hebbian learning to all active segments in correctly predicted
@@ -166,10 +183,14 @@ class TemporalMemory:
         # Add synapses to active segments until they have self.add_synapses many
         # active presynapses.
         self.synapses.output_sdr.index     = segments
-        self.synapses.output_sdr.nz_values = np.array(np.maximum(0, self.add_synapses - self.potential_excitement[segments]), dtype=np.uint8)
+        potential_excitement               = self.potential_excitement[segments]
+        potential_excitement.dtype         = np.int32
+        add_synapses_per_output            = np.maximum(0, self.add_synapses - potential_excitement)
         self.synapses.add_synapses(
+            num_synapses         = add_synapses_per_output,
+            maximum_synapses     = self.synapses_per_segment,
             maximum_new_synapses = self.add_synapses,
-            maximum_synapses     = self.synapses_per_segment,)
+            evict                = True,)
 
     def _learn_bursting(self, bursting_columns):
         # Select a single segment to learn in every bursting column.
@@ -220,11 +241,15 @@ class TemporalMemory:
 
         # Create additional synapses.  Add synapses to the segments until they
         # have self.add_synapses many active presynapses.
-        self.synapses.output_sdr.index     = burst_learning
-        self.synapses.output_sdr.nz_values = np.array(self.add_synapses - self.potential_excitement[burst_learning], dtype=np.uint8)
+        self.synapses.output_sdr.index     = burst_learning        
+        potential_excitement               = self.potential_excitement[burst_learning]
+        potential_excitement.dtype         = np.int32
+        add_synapses_per_output            = np.maximum(0, self.add_synapses - potential_excitement)
         self.synapses.add_synapses(
+            num_synapses         = add_synapses_per_output,
             maximum_new_synapses = self.add_synapses,
-            maximum_synapses     = self.synapses_per_segment,)
+            maximum_synapses     = self.synapses_per_segment,
+            evict                = True,)
 
         # Return a list of neurons which are learning.  Strip off the segments
         # dimension.

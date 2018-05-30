@@ -4,6 +4,7 @@ import numpy as np
 import math
 from fractions import Fraction
 import random
+import itertools
 
 def _choose(n, r):
     """Number of ways to choose 'r' unique elements from set of 'n' elements."""
@@ -472,22 +473,24 @@ class SparseDistributedRepresentation:
 SDR = SparseDistributedRepresentation
 
 
+# TODO: Instead of calling assign-flat-concat, make and use this class
+#   First write the docstrings for it...
 class SDR_Concatenation(SDR):
     """
-    TODO: Instead of calling assign-flat-concat, make and use this class
 
-    This class does NOT allow directly setting its value.  Instead set the value
-    of all component SDRs which are concat'd by this
-
-    Attempting to use the value of this SDR will trigger the concat operation
-    as well as any callbacks which are registered on this SDR instance.
+    SDR concatenations are read only.  To change its value assign to any of the
+    component SDRs.  This SDRs value is computed and cached when it is accessed.
     """
     def __init__(self, concat_sdrs, axis=None):
-        assert(False) # Unimplemented
-        assert(axis is None) # Unimplemented
-        self._concat_sdrs = tuple(concat_sdrs)
-        assert(all(isinstance(x, SDR) for x in self._concat_sdrs))
+        """
+        """
+        self.input_sdrs = tuple(concat_sdrs)
+        assert(all(isinstance(x, SDR) for x in self.input_sdrs))
+        concat_dim = sum(sdr.dimensions[axis] for sdr in self.input_sdrs)
+        # assert(all(dims are ok excpt for axis which can be anything...))
         self.size = sum(x.size for x in self._concat_sdrs)
+        self.dimensions = 1/0
+        self.valid = False
         for sdr in self._concat_sdrs:
             sdr._callbacks.append(self._callback)
 
@@ -506,9 +509,6 @@ class SDR_Concatenation(SDR):
                 self._dense = np.zeros(self.dimensions, dtype=np.uint8)
                 self._dense[self.index] = nz_values
         return self._dense
-    @dense.setter
-    def dense(self, value):
-        1/0
 
     @property
     def index(self):
@@ -518,9 +518,6 @@ class SDR_Concatenation(SDR):
             elif self._dense is not None:
                 self._index = np.nonzero(self._dense)
         return self._index
-    @index.setter
-    def index(self, value):
-        1/0
 
     @property
     def flat_index(self):
@@ -530,9 +527,6 @@ class SDR_Concatenation(SDR):
             elif self._dense is not None:
                 self._flat_index = np.nonzero(self._dense.reshape(-1))[0]
         return self._flat_index
-    @flat_index.setter
-    def flat_index(self, value):
-        1/0
 
     @property
     def nz_values(self):
@@ -545,24 +539,85 @@ class SDR_Concatenation(SDR):
             else:
                 self._nz_values = np.ones(len(self), dtype=np.uint8)
         return self._nz_values
-    @nz_values.setter
-    def nz_values(self, value):
-        1/0
-
-    def assign(self, sdr):
-        1/0
 
 
-# TODO: This should allow for topology???
 class SDR_Subsample(SDR):
     """
-    Makes an SDR smaller by randomly removing bits.  SDR subsamples are read
-    only.
+    Makes an SDR smaller by randomly removing bits.
+
+    This class can also consolidate topological dimensions by lumping blocks of
+    the input SDR into a single topological area of the output SDR.
+
+    SDR subsamples are read only.  Assignment to the input SDR clears this SDR's
+    value and this SDR's value is computed and cached when it is accessed.
     """
-    def __init__(self, sdr, subsample):
-        1/0 # unimplemented
-        self.sdr = sdr
-        sdr._callbacks.append(self._clear)
+    def __init__(self, sdr, dimensions):
+        """
+        Argument input_sdr is an instance of SDR ...
+
+        Argument dimensions is a tuple of N integers.  This tuple is divided
+            into the first N-1 numbers which represent the topological
+            dimensions and the final number which represents all of the extra
+            dimensions.  The input SDR is assumed to have the same number of
+            topological dimensions as this subsample.  This class resizes the
+            topological dimensions from the input SDR to the output SDR's
+            dimensions and lumps and inputs which are condensed into an area
+            into the same extra dimension.  Then the extra dimension is
+            subsampled so that there are as many inputs in each topological area
+            as the argument dimensions[-1] specifies.
+
+        Example:  SDR_Subsample(SDR((200, 200, 2)), (8, 8, 400))
+        In this example there are 2 topological dimensions.
+
+        First this reshapes the topological dimensions from (200, 200) to (8, 8)
+        by cutting the input SDR into rectangles of size (200/8, 200/8) which
+        equals (25, 25).  Each (25, 25) rectangle of the input space is
+        extracted, flattened and stored as a single point in the output spaces
+        (8, 8) grid, yielding a shape of (8, 8, 25*25*2) which equals
+        (8, 8, 1250).  
+
+        Second this takes a random sample of the extra dimension, and discards
+        the remainder of it.  This brings the shape from (8, 8, 1250) to
+        (8, 8, 400).
+        """
+        SDR.__init__(self, dimensions)
+        assert(isinstance(input_sdr, SDR))
+        self.input_sdr = input_sdr
+        self.input_sdr._callbacks.append(self._clear)
+        # This SDR can not be assigned to so using _callbacks doesn't make
+        # sense. If anything, use the input_sdr's _callbacks list.
+        self._callbacks = None
+
+        # Determine how to chop up the input space into evenly-sized rectangles.
+        area_slices = []
+        nd_topological = len(self.dimensions) - 1
+        for dim in range(nd_topological):
+            inp_dim_sz = self.input_sdr.dimensions[dim]
+            out_dim_sz = self.dimensions[dim]
+            bounds     = np.linspace(0, inp_dim_sz, out_dim_sz + 1)
+            bounds     = np.array(np.rint(bounds), dtype=np.int)
+            slices     = [slice(st, end) for st, end in zip(bounds, bounds[1:])]
+            area_slices.append(slices)
+
+        # Internaly this uses an array of flat indices specifying which input
+        # goes to each output location.
+        self.sources   = np.empty(self.size, dtype=np.int)
+        input_indices  = np.arange(self.input_sdr.size)
+        input_indices  = input_indices.reshape(self.input_sdr.dimensions)
+        # Flatten the topological dimensions for easier access.
+        subsample_size = self.dimensions[-1]
+        self.sources   = self.sources.reshape(-1, subsample_size)
+
+        # Iterate through every topological output area and sample some inputs.
+        for out_topo_idx, slice_tuple in enumerate(itertools.product(*area_slices)):
+            potential_sources = input_indices[slice_tuple]
+            potential_sources = potential_sources.flatten()
+            subsample_sources = np.random.choice(
+                potential_sources,
+                subsample_size,
+                replace=False)
+            self.sources[out_topo_idx] = subsample_sources
+        self.sources = self.sources.reshape(self.dimensions)
 
     def _clear(self):
         self._dense      = None
@@ -572,21 +627,24 @@ class SDR_Subsample(SDR):
 
     @property
     def dense(self):
-        1/0 # unimplemented.
+        if self._dense is None:
+            self._dense = self.input_sdr.dense[self.sources]
         return self._dense
-    
+
     @property
     def index(self):
-        1/0 # unimplemented.
+        if self._index is None:
+            self._index = np.nonzero(self.dense)
         return self._index
 
     @property
     def flat_index(self):
-        1/0 # unimplemented.
+        if self._flat_index is None:
+            self._flat_index = np.nonzero(self.dense.reshape(-1))[0]
         return self._flat_index
-    
+
     @property
     def nz_values(self):
-        1/0 # unimplemented.
+        if self._nz_values is None:
+            self._nz_values = self.dense.reshape(-1)[self.flat_index]
         return self._nz_values
-    
