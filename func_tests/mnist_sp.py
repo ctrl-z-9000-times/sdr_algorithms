@@ -7,7 +7,7 @@ import sys
 sys.path.append('.')
 from spatial_pooler import SpatialPooler
 from sdr import SDR
-from classifiers import SDR_Classifier
+from nupic.algorithms.sdr_classifier import SDRClassifier
 import scipy.ndimage
 import numpy as np
 
@@ -145,6 +145,16 @@ if __name__ == '__main__':
 
     # Load data.
     train_labels, train_images, test_labels, test_images = load_mnist()
+
+    if False:
+        # Experiment to verify that input dimensions are handled correctly If
+        # you enable this, don't forget to rescale the radii as well as the
+        # input.
+        from scipy.ndimage import zoom
+        new_sz = (1, 4, 1)
+        train_images = [zoom(im, new_sz, order=0) for im in train_images]
+        test_images  = [zoom(im, new_sz, order=0) for im in test_images]
+
     training_data = list(zip(train_images, train_labels))
     test_data     = list(zip(test_images, test_labels))
     # Setup spatial pooler machine.
@@ -153,7 +163,6 @@ if __name__ == '__main__':
         active_thresh     = 24,
         boosting_alpha    = 0.000701925973755,
         init_dist         = (0.4, 0.1),
-        min_stability     = None,
         mini_columns      = 200,
         permanence_dec    = 0.0132731225331,
         permanence_inc    = 0.031055329686,
@@ -164,11 +173,7 @@ if __name__ == '__main__':
         input_sdr         = enc.output,
         radii             = (3.21, 2.13),
         macro_columns     = (10, 10))
-    class_shape   = (10,)
-    sdrc = SDR_Classifier(
-        alpha      = 0.00134801937887,
-        input_sdr  = sp.columns,
-        num_labels = 10)
+    sdrc = SDRClassifier(steps=[0])
 
     print(sp.statistics())
 
@@ -181,10 +186,12 @@ if __name__ == '__main__':
         enc.encode(np.squeeze(img))
         sp.compute()
         sp.learn()
-        lbl_pdf = np.zeros(10)
-        lbl_pdf[lbl] = 1
-        sdrc.train(lbl_pdf)
+        sdrc.compute(i, sp.columns.flat_index,
+            classification={"bucketIdx": lbl, "actValue": lbl},
+            learn=True, infer=False)
 
+    print("Removing zero permanence synapses.")
+    sp.synapses.remove_zero_permanence_synapses()
     print(sp.statistics())
 
     # Testing Loop
@@ -192,10 +199,11 @@ if __name__ == '__main__':
     for img, lbl in test_data:
         enc.encode(np.squeeze(img))
         sp.compute()
-        prediction  = np.argmax(sdrc.predict())
-        if prediction == lbl:
-            score   += 1
-    print('Score:', score / len(test_data))
+        inference = sdrc.infer(sp.columns.flat_index, None)
+        if lbl == np.argmax(inference[0]):
+            score += 1
+
+    print('Score:', 100 * score / len(test_data), '%')
 
 
 if False:
@@ -217,45 +225,3 @@ if False:
             return new_images
         train_images = expand_images(train_images)
         test_images  = expand_images(test_images)
-
-    if False:
-        # Experiment to verify that input dimensions are handled correctly
-        # If you enable this, don't forget to rescale the radii as well as the input.
-        from scipy.ndimage import zoom
-        new_sz = (1, 4, 1)
-        train_images = [zoom(im, new_sz, order=0) for im in train_images]
-        test_images  = [zoom(im, new_sz, order=0) for im in test_images]
-
-    if False:
-        # Show Diagnostics for a sample input
-        state = sp.compute(rand_imgs_enc[0], diag=True)   # Learning & boosting enabled
-        sp.synapses.synapse_histogram(diag=True)
-        sp.synapses.permanence_histogram(diag=True)
-
-        if plot_noise_robustness:
-            x1, y1 = sp.noise_robustness(rand_imgs_enc)
-            plt.figure(2)
-            plt.plot(x0, y0, 'r', x1, y1, 'g')
-            # plt.title("Noise Robustness. Red is before, Green is after training %d cycles"%sp.age)
-
-    if False:
-        # Show a table of SP inputs & outputs
-        examples = 4    # This many rows of examples, one example per row
-        cols = 6        # This many columns
-        plt.figure('Examples')
-        for row in range(examples):
-            for sub_col in range(int(cols / 2)):
-                img, lbl = random.choice(test_data)
-                img_enc = np.squeeze(enc.encode(img))
-                state = sp.compute(img_enc, learn=False)   # No boosting here!
-                prediction = np.argmax(sdrc.predict(state))
-                plt.subplot(examples, cols, row*cols + sub_col*2 + 1)
-                plt.imshow(np.dstack([img]*3)/255., interpolation='nearest')
-                plt.title("Label: %s"%lbl)
-                # Show the column activations
-                state_visual = np.zeros(col_shape)
-                state_visual[state] = 1
-                plt.subplot(examples, cols, row*cols + sub_col*2 + 2)
-                plt.imshow(np.dstack([state_visual]*3), interpolation='nearest')
-                plt.title("Classification %d"%prediction)
-    plt.show()
