@@ -172,6 +172,9 @@ if __name__ == '__main__':
         confusion[lbl] += inference[0]
     print("Score:", 100 * score / score_samples, '%')
 
+    tm.synapses.check_data_integrity()
+    print("Synapse data structure integrity is OK.")
+
     import matplotlib.pyplot as plt
     plt.figure('Confusion Matrix')
     plt.imshow(confusion, interpolation='nearest')

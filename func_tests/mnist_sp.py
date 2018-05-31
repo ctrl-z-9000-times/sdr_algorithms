@@ -204,6 +204,8 @@ if __name__ == '__main__':
             score += 1
 
     print('Score:', 100 * score / len(test_data), '%')
+    sp.synapses.check_data_integrity()
+    print("Synapse data structure integrity is OK.")
 
 
 if False:
