@@ -241,7 +241,9 @@ class SparseDistributedRepresentation:
         alpha = self.activation_frequency_alpha
         # Decay with time and incorperate this sample.
         self.activation_frequency             *= (1 - alpha)
-        self.activation_frequency[self.index] += alpha * self.nz_values
+        # Don't include NZ_Values, first because it's not correct and second
+        # because it is set to None at the point where this is called.
+        self.activation_frequency[self.index] += alpha
 
     def _track_average_overlap(self):
         alpha                = self.average_overlap_alpha
@@ -551,7 +553,7 @@ class SDR_Subsample(SDR):
     SDR subsamples are read only.  Assignment to the input SDR clears this SDR's
     value and this SDR's value is computed and cached when it is accessed.
     """
-    def __init__(self, sdr, dimensions):
+    def __init__(self, input_sdr, dimensions):
         """
         Argument input_sdr is an instance of SDR ...
 

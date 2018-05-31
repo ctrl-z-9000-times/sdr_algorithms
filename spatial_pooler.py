@@ -164,63 +164,43 @@ class SpatialPooler:
         self.columns.index  = tuple(selected_columns)
 
         if self.min_stability is not None:
-            # self.stabilize(column_excitement)
-            self._stabilize_w_topo(column_excitement)
+            self.stabilize(column_excitement)
+
+        # if learn:
+        #     self.learn()
 
         return self.columns
 
-    def stabilize(self, column_excitement):
-        """
-        This activates prior columns to force active in order to maintain
-        (self.min_stability) percent of column overlap between time steps.  Always call
-        this between compute and learn!
-
-        Argument column_excitement is array of each mini-column's excitement.
-        """
-
-        self.natural_stability = self.columns.overlap(self.prev_columns)
-        num_active      = len(self.columns)
-        stabile_columns = int(round(num_active * self.natural_stability))
-        target_columns  = int(round(num_active * self.min_stability))
-        add_columns     = target_columns - stabile_columns
-        if add_columns <= 0:
-            return
-
-        eligable_columns  = np.setdiff1d(self.prev_columns.flat_index, self.columns.flat_index)
-        eligable_excite   = column_excitement.reshape(-1)[eligable_columns]
-        add_columns       = min(add_columns, len(eligable_excite))
-        selected_col_nums = np.argpartition(-eligable_excite, add_columns-1)[:add_columns]
-        selected_columns  = eligable_columns[selected_col_nums]
-        selected_index    = np.unravel_index(selected_columns, self.columns.dimensions)
-        self.columns.flat_index = np.concatenate([self.columns.flat_index, selected_columns])
-        self.prev_columns.assign(self.columns)
-
-    # TODO: Should this base the target stability on the number of currently
-    # active columns, instead of previously active?  Or better yet use something
-    # simple like (self.mini_columns * self.sparsity * self.min_stability) ???
-    # And have none of the macro columns or activation_threshold irregularities?
-    def _stabilize_w_topo(self, column_excitement):
+    def stabilize(self,
+        # active_columns,
+        # prev_active_columns,
+        column_excitement,
+        learn=True):
         """
         This activates prior mini-columns to force active in order to maintain
         (self.min_stability) percent of mini-column overlap between time steps.
         Always call this between compute and learn!
 
+        Argument active_columns is a tuple of index arrays
+        Argument prev_active_columns is an SDR
         Argument column_excitement is array of each mini-column's excitement.
+
+        Returns index tuple of stablizing column activations.
         """
         # Determine how many previously active mini-columns are still active in
         # each macro-column.
         stable_columns    = np.logical_and(self.prev_columns.dense, self.columns.dense)
         natural_stability = np.sum(stable_columns, axis = -1)
         num_prev_columns  = np.sum(self.prev_columns.dense, axis = -1)
-        target_stability  = np.array(np.rint(num_prev_columns * self.min_stability), dtype=np.int)
+        target_stability  = int(round(self.mini_columns * self.sparsity * self.min_stability))
         # add_columns is the number of mini-columns to activate in each macro-
         # column in order to meet the target stability.
         add_columns       = target_stability - natural_stability
         add_columns       = np.maximum(0, add_columns).reshape(-1)
 
         # Find the average natural stability for the whole SP.
-        self.natural_stability = np.sum(natural_stability) / len(self.prev_columns)
-        self.natural_stability = np.nan_to_num(self.natural_stability) # Don't die friends.
+        target_active          = round(self.columns.size * self.sparsity)
+        self.natural_stability = np.sum(natural_stability) / target_active
 
         # Search for minicolumns which were previously active and are no longer
         # active.

@@ -27,7 +27,7 @@ class TemporalMemory:
         learning_threshold,       # Segment excitement threshold for learning.
         predicted_boost,          # Predicted cells activate this many times.
         context_sdr=None,
-        anomaly_alpha = 1/1000,
+        anomaly_alpha = 1/1000,     # Rename to "diagnostics_alpha"?
         ):
         """
         Argument parameters is an instance of TemporalMemoryParameters
@@ -48,7 +48,7 @@ class TemporalMemory:
         self.segments_per_cell   = segments_per_cell
         assert(self.segments_per_cell > 0)
         self.active              = SDR((self.columns.size, self.cells_per_column),
-                                        activation_frequency_alpha = 1/1000,)
+                                        activation_frequency_alpha = anomaly_alpha,)
         self.learning            = SDR(self.active)
         self.anomaly_alpha       = anomaly_alpha
         self.mean_anomaly        = 1.0

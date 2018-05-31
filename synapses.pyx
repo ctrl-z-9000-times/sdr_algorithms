@@ -26,13 +26,6 @@ cdef _min(int a, int b):
         return a
     return b
 
-# TODO: Make a function which verifies the internal data table integrity:
-#       Check that all data tables exist and have the correct data type.
-#       Check that input -> output and output -> input yields the same connection.
-#       Check that presyn_parts is okay.
-#       Check that presyn_sizes is okay.
-#       Check that all perms in range [0, 1]
-#       Check that presyn-perms == postsyn-perms
 
 class SynapseManager:
     """
@@ -924,6 +917,89 @@ class SynapseManager:
         #     stats += 'Potential Pool Density {:5g}\n'.format(pp_density)
 
         return stats
+
+    def check_data_integrity(self):
+        """
+        This method checks that the internal data structures are all okay.
+
+        Checks that all data tables exist and have the correct data type.
+        Checks that input -> output and output -> input yields the same connection.
+        Checks that presyn_parts is okay.
+        Checks that presyn_sizes is okay.
+        Checks that all perms in range [0, 1]
+        Checks that presyn-perms == postsyn-perms
+        """
+        presyn_perms = getattr(self, "presynaptic_permanences", None)
+        # Check postsynaptic/output side data tables.
+        for out_idx1 in range(self.output_sdr.size):
+            sources1_inner = self.postsynaptic_sources[out_idx1]
+            sources2_inner = self.postsynaptic_source_side_index[out_idx1]
+            permanences    = self.postsynaptic_permanences[out_idx1]
+            # Check table size and type.
+            assert(len(sources1_inner.shape) == 1)
+            assert(sources1_inner.shape == sources2_inner.shape)
+            assert(sources1_inner.shape == permanences.shape)
+            assert(sources1_inner.dtype == INDEX)
+            assert(sources2_inner.dtype == INDEX)
+            assert(permanences.dtype == PERMANENCE)
+            assert(np.all(permanences >= 0.))
+            assert(np.all(permanences <= 1.))
+            # Check Output -> Input linkage.
+            for out_idx2 in range(sources1_inner.shape[0]):
+                inp_idx1 = sources1_inner[out_idx2]
+                inp_idx2 = sources2_inner[out_idx2]
+                assert(inp_idx2 < self.presynaptic_sinks_sizes[inp_idx1])
+
+                sinks1_inner = self.presynaptic_sinks[inp_idx1]
+                sinks2_inner = self.presynaptic_sink_side_index[inp_idx1]
+                assert(sinks1_inner[inp_idx2] == out_idx1)
+                assert(sinks2_inner[inp_idx2] == out_idx2)
+                if presyn_perms is not None:
+                    assert(presyn_perms[inp_idx1][inp_idx2] == permanences[out_idx2])
+
+        # Check presynaptic/input side data tables.
+        assert(self.presynaptic_sinks_sizes.shape == (self.input_sdr.size,))
+        assert(self.presynaptic_partitions.shape  == (self.input_sdr.size,))
+        assert(self.presynaptic_sinks_sizes.dtype == INDEX)
+        assert(self.presynaptic_partitions.dtype  == INDEX)
+        for inp_idx1 in range(self.input_sdr.size):
+            sinks1_inner = self.presynaptic_sinks[inp_idx1]
+            sinks2_inner = self.presynaptic_sink_side_index[inp_idx1]
+            # Check table size and type.
+            assert(len(sinks1_inner.shape) == 1)
+            assert(sinks1_inner.shape == sinks2_inner.shape)
+            assert(sinks1_inner.dtype == INDEX)
+            assert(sinks2_inner.dtype == INDEX)
+
+            if presyn_perms is not None:
+                presyn_perms_inner = presyn_perms[inp_idx1]
+                assert(sinks1_inner.shape == presyn_perms_inner.shape)
+                assert(presyn_perms_inner.dtype == PERMANENCE)
+
+            sinks_size = self.presynaptic_sinks_sizes[inp_idx1]
+            assert(sinks_size <= sinks1_inner.shape[0])
+
+            partition = self.presynaptic_partitions[inp_idx1]
+            assert(partition >= 0 and partition <= sinks_size)
+
+            # Check Input -> Output linkage.
+            for inp_idx2 in range(sinks_size):
+                out_idx1 = sinks1_inner[inp_idx2]
+                out_idx2 = sinks2_inner[inp_idx2]
+
+                sources1_inner = self.postsynaptic_sources[out_idx1]
+                sources2_inner = self.postsynaptic_source_side_index[out_idx1]
+                assert(sources1_inner[out_idx2] == inp_idx1)
+                assert(sources2_inner[out_idx2] == inp_idx2)
+                permanece = self.postsynaptic_permanences[out_idx1][out_idx2]
+                if presyn_perms is not None:
+                    assert(presyn_perms_inner[inp_idx2] == permanece)
+                # Check partition
+                if permanece >= self.permanence_thresh:
+                    assert(inp_idx2 < partition)
+                else:
+                    assert(inp_idx2 >= partition)
+
 
 @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
 @cython.wraparound(False)  # Turns off negative index wrapping for entire function.
