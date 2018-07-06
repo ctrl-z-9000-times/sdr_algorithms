@@ -5,7 +5,8 @@ import random
 from sdr import SDR
 from synapses import SynapseManager
 
-
+# TODO: How hard would it be to make the outward facing tm.active to have the
+# shape (column_sdr.dimensions + (cells_per_column,)) ???
 class TemporalMemory:
     """
     This implementation is based on the paper: Hawkins J. and Ahmad S. (2016)
@@ -41,14 +42,15 @@ class TemporalMemory:
         assert(isinstance(column_sdr,  SDR))
         assert(isinstance(context_sdr, SDR) or context_sdr is None)
         self.columns             = column_sdr
-        self.context_sdr         = context_sdr
+        self.context_sdr         = SDR(context_sdr) if context_sdr is not None else None
         self.cells_per_column    = cells_per_column
         if self.cells_per_column < 1:
             raise ValueError("Cannot create TemporalMemory with cells_per_column < 1.")
         self.segments_per_cell   = segments_per_cell
         assert(self.segments_per_cell > 0)
         self.active              = SDR((self.columns.size, self.cells_per_column),
-                                        activation_frequency_alpha = anomaly_alpha,)
+                                        activation_frequency_alpha = anomaly_alpha,
+                                        average_overlap_alpha      = anomaly_alpha,)
         self.learning            = SDR(self.active)
         self.anomaly_alpha       = anomaly_alpha
         self.mean_anomaly        = 1.0
@@ -99,6 +101,7 @@ class TemporalMemory:
             self.context_sdr.assign(context_sdr)
             self.synapses.input_sdr.assign_flat_concatenate((self.active, self.context_sdr))
         else:
+            assert(context_sdr is None)
             self.synapses.input_sdr.assign(self.active)
         excitement, potential    = self.synapses.compute()
         self.excitement          = excitement
@@ -149,6 +152,8 @@ class TemporalMemory:
         # Set the inputs to the previous winner cells.  Grow synapses from these
         # cells and reinforce synapses from them.
         if self.context_sdr is not None:
+            if context_learning_sdr is None:
+                context_learning_sdr = self.context_sdr
             self.synapses.input_sdr.assign_flat_concatenate((self.learning, context_learning_sdr))
         else:
             self.synapses.input_sdr.assign(self.learning)

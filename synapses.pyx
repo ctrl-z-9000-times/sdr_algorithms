@@ -26,7 +26,6 @@ cdef _min(int a, int b):
         return a
     return b
 
-
 class SynapseManager:
     """
     This class models a set of synapses between two SDRs.
@@ -47,6 +46,11 @@ class SynapseManager:
         the method rebuild_indexes().  These two tables specify the pool of
         potential and connected input connections to each output location, and
         are refered to as the "potential_pool".
+
+    Attibute postsynaptic_sources_sizes
+        postsynaptic_sources_sizes[output-index] = The logical size of the 
+        postsnyaptic_sources entry.  The postsynaptic tables are allocated with
+        extra room at the end for fast adding and removing synapses.
 
     Attributes presynaptic_sinks, presynaptic_sinks_sizes
         presynaptic_sinks[input-index] = 1D array of potential output indices.
@@ -100,6 +104,8 @@ class SynapseManager:
         sm.output_sdr.size <= 2^32, output space is addressable by type INDEX.
 
         sm.postsynaptic_sources.dtype == INDEX, index into input space.
+
+        sm.postsynaptic_sources_sizes.dtype == INDEX
 
         sm.postsynaptic_source_side_index.dtype == INDEX, maximum number of 
             outputs which an input could connect to, size of output space.
@@ -202,7 +208,6 @@ class SynapseManager:
                 maximum_new_synapses = initial_potential_pool,
                 maximum_synapses     = initial_potential_pool,
                 init_dist            = init_dist,)
-
 
     @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
     @cython.wraparound(False)  # Turns off negative index wrapping for entire function.
@@ -330,6 +335,7 @@ class SynapseManager:
             np.ndarray[object]      sources          = self.postsynaptic_sources
             np.ndarray[object]      sources2         = self.postsynaptic_source_side_index
             np.ndarray[object]      permanences      = self.postsynaptic_permanences
+            np.ndarray[INDEX_t]     sources_sizes    = self.postsynaptic_sources_sizes
             np.ndarray[object]      sinks            = self.presynaptic_sinks
             np.ndarray[object]      sinks2           = self.presynaptic_sink_side_index
             np.ndarray[object]      presyn_perms     = getattr(self, 'presynaptic_permanences', None)
@@ -344,6 +350,7 @@ class SynapseManager:
             np.ndarray[PERMANENCE_t] presyn_perms_inner = None
 
             # Indexes and locals
+            INDEX_t out_size
             INDEX_t out_iter, out_idx1, out_idx2
             INDEX_t inp_idx1, inp_idx2, inp_idx2_swap
             INDEX_t partition
@@ -364,8 +371,9 @@ class SynapseManager:
             sources_inner    = <np.ndarray[INDEX_t]>      sources[out_idx1]
             sources2_inner   = <np.ndarray[INDEX_t]>      sources2[out_idx1]
             perms_inner      = <np.ndarray[PERMANENCE_t]> permanences[out_idx1]
+            out_size         = sources_sizes[out_idx1]
 
-            for out_idx2 in range(sources_inner.shape[0]):
+            for out_idx2 in range(out_size):
                 inp_idx1     = sources_inner[out_idx2]
                 perm_value   = perms_inner[out_idx2]
                 syn_prior    = perm_value >= thresh
@@ -412,6 +420,7 @@ class SynapseManager:
                         inp_idx2,
                         inp_idx2_swap)
 
+    # TODO: Compute maximum_new_synapses locally.
     @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
     @cython.wraparound(False)  # Turns off negative index wrapping for entire function.
     @cython.profile(DEBUG)
@@ -437,6 +446,10 @@ class SynapseManager:
         Argument init_dist is (mean, std) of synapse initial permanence
             distribution.   Optional: If not given this will use the values the
             synapse manager was initialized with.
+
+        Optional Argument evict is boolean, default False.  If true this will
+            make room for new syanpases on full segments by removing some of the
+            synapses with the minimum permanences.
         """
         # Arguments.
         self.input_sdr.assign(input_sdr)
@@ -457,6 +470,7 @@ class SynapseManager:
             np.ndarray[object] sources       = self.postsynaptic_sources
             np.ndarray[object] sources2      = self.postsynaptic_source_side_index
             np.ndarray[object] permanences   = self.postsynaptic_permanences
+            np.ndarray[INDEX_t] sources_sizes = self.postsynaptic_sources_sizes
             np.ndarray[object] presyn_perms  = getattr(self, 'presynaptic_permanences', None)
             np.ndarray[object] sinks         = self.presynaptic_sinks
             np.ndarray[object] sinks2        = self.presynaptic_sink_side_index
@@ -482,7 +496,7 @@ class SynapseManager:
             int max_syn     = maximum_synapses
             int max_new_syn = min(maximum_new_synapses, inputs.shape[0])
             int nsyn_to_add
-            int orig_nsyn
+            INDEX_t orig_nsyn, num_new_syns
             # Evict min perm synapses variables.
             bint evict_ = bool(evict)
             int overrun, evict_iter, out_idx2_remove
@@ -492,40 +506,47 @@ class SynapseManager:
             int topo_out_idx, next_topo_area
             np.ndarray[np.double_t] input_p = None
 
+            int buff_size
             np.ndarray[INDEX_t]      index_buffer = np.full(max_new_syn, -1,           dtype=INDEX)
             np.ndarray[PERMANENCE_t] perms_buffer = np.full(max_new_syn, float('nan'), dtype=PERMANENCE)
 
         # Setup topology.
         if source_dist is not None:
-            IF DEBUG:
-                assert(np.all(outputs == np.sort(outputs)))
             nd_topological = len(self.radii)
             topo_area_size = np.product(self.output_sdr.dimensions[nd_topological : ])
             topo_inp_index = self.input_sdr.index[ : nd_topological]
             next_topo_area = 0
+            IF DEBUG:
+                output_topo_areas = outputs // topo_area_size
+                assert(np.all(output_topo_areas == np.sort(output_topo_areas)))
+                assert(np.all(new_syns >= 0))         # Surely an error, check for unsigned less than zero mistakes.
+                assert(np.all(new_syns <= max_syn))   # Surely an error, check for unsigned less than zero mistakes.
         else:
             next_topo_area = self.output_sdr.size
 
         for out_iter in range(outputs.shape[0]):
-            out_idx           = outputs[out_iter]
-            nsyn_to_add       = new_syns[out_iter]
-            sources_inner     = <np.ndarray[INDEX_t]>  sources[out_idx]
-            sources2_inner    = <np.ndarray[INDEX_t]>  sources2[out_idx]
-            perms_inner       = <np.ndarray[PERMANENCE_t]> permanences[out_idx]
+            out_idx     = outputs[out_iter]
+            nsyn_to_add = new_syns[out_iter]
+            orig_nsyn   = sources_sizes[out_idx]
 
-            IF DEBUG:
-                assert(nsyn_to_add <= max_syn)   # Surely an error, check for unsigned less than zero mistakes.
             # Can not add more synapses than there are available inputs for.
             nsyn_to_add = _min(nsyn_to_add, max_new_syn)
-            # Enforce the maximum number of synapses per output.
-            overrun = sources_inner.shape[0] + nsyn_to_add - max_syn
+            # Make room on the segment for more synapses by removing minimum
+            # permanence synapses, if desired.
+            overrun = orig_nsyn + nsyn_to_add - max_syn
             if evict_ and overrun > 0:
-                # Remove some synapses to make room.
+                sources_inner  = <np.ndarray[INDEX_t]>  sources[out_idx]
+                perms_inner    = <np.ndarray[PERMANENCE_t]> permanences[out_idx]
                 evict_synapses = _find_min_perm_synapses(
                     overrun,
                     sources_inner,
                     perms_inner,
+                    orig_nsyn,
                     inputs,)
+                # Removing synapses changes where all of the synapses are, so
+                # sort and remove from the ends of the postsynaptic tables so
+                # that the evict_synapses stay in the same place until they're
+                # removed.  
                 evict_synapses.sort()
                 for evict_iter in range(evict_synapses.shape[0] - 1, -1, -1):
                     out_idx2_remove = evict_synapses[evict_iter]
@@ -533,22 +554,26 @@ class SynapseManager:
                         sources,
                         sources2,
                         permanences,
+                        sources_sizes,
                         sinks,
                         sinks2,
                         presyn_perms,
                         sinks_parts,
                         sinks_sizes,
+                        thresh,
                         out_idx,
-                        out_idx2_remove,
-                        thresh,)
-                # Reload the inner data tables B/C they've changed.
-                sources_inner     = <np.ndarray[INDEX_t]>  sources[out_idx]
-                sources2_inner    = <np.ndarray[INDEX_t]>  sources2[out_idx]
-                perms_inner       = <np.ndarray[PERMANENCE_t]> permanences[out_idx]
-
-            nsyn_to_add = _min(nsyn_to_add, max_syn - sources_inner.shape[0])
+                        out_idx2_remove,)
+                orig_nsyn = sources_sizes[out_idx]
+            # Enforce the maximum number of synapses per output.
+            nsyn_to_add = _min(nsyn_to_add, max_syn - orig_nsyn)
             if nsyn_to_add == 0:
                 continue
+
+            # Reload these inner data tables after evicting synapses B/C they've
+            # changed.
+            sources_inner     = <np.ndarray[INDEX_t]>  sources[out_idx]
+            sources2_inner    = <np.ndarray[INDEX_t]>  sources2[out_idx]
+            perms_inner       = <np.ndarray[PERMANENCE_t]> permanences[out_idx]
 
             # Check if out_iter has moved to a new topological area.
             if out_idx >= next_topo_area:
@@ -566,20 +591,31 @@ class SynapseManager:
             unique_sources    = np.isin(candidate_sources, sources_inner, invert=True,
                                         assume_unique = True,)
             new_sources = candidate_sources[unique_sources]
+            num_new_syns = new_sources.shape[0]
 
             # Random initial distribution of permanence values.
-            new_permanances_f64 = np.random.normal(init_mean, init_std, size=new_sources.shape[0])
+            new_permanances_f64 = np.random.normal(init_mean, init_std, size=num_new_syns)
             new_permanances     = np.array(new_permanances_f64, dtype=PERMANENCE)
             np.clip(new_permanances, 0., 1., out=new_permanances)
 
+            # Resize the sources tables to fit the new synapses.
+            if orig_nsyn + num_new_syns > sources_inner.shape[0]:
+                # Don't allocate room for more synapses than could possibly fit
+                # on the segment.  buff_size slices off useful portion of buffer.
+                buff_size = _min(max_syn - sources_inner.shape[0], max_new_syn)
+                sources[out_idx]     = sources_inner  = np.append(sources_inner,  index_buffer[:buff_size])
+                sources2[out_idx]    = sources2_inner = np.append(sources2_inner, index_buffer[:buff_size])
+                permanences[out_idx] = perms_inner    = np.append(perms_inner,    perms_buffer[:buff_size])
+            # Note: num_new_syns changes meanings: from number of synapses to
+            # be added, to total number of synapses after adding them.
+            num_new_syns += orig_nsyn
+            sources_sizes[out_idx] = num_new_syns
             # Append to the postsynaptic source tables.
-            orig_nsyn            = sources_inner.shape[0]
-            sources[out_idx]     = sources_inner  = np.append(sources_inner, new_sources)
-            permanences[out_idx] = perms_inner    = np.append(perms_inner, new_permanances)
-            sources2[out_idx]    = sources2_inner = np.append(sources2_inner, index_buffer[ : new_sources.shape[0]])
+            sources_inner[orig_nsyn : num_new_syns] = new_sources
+            perms_inner[  orig_nsyn : num_new_syns] = new_permanances
 
             # Process each new synapse into the data tables.
-            for out_idx2 in range(orig_nsyn, sources_inner.shape[0]):
+            for out_idx2 in range(orig_nsyn, num_new_syns):
                 inp_idx1  = sources_inner[out_idx2]
                 perm      = perms_inner[out_idx2]
 
@@ -625,17 +661,22 @@ class SynapseManager:
         """
         This method uses the postsynaptic_sources and postsynaptic_permanences
         tables to rebuild all of the other needed tables.
+
+        Notice: this does NOT use attribute postsynaptic_sources_sizes, this
+        assumes that every synapse in the potential pool is valid.
         """
         cdef:
-            # Data tables
-            np.ndarray[object]  sources          = self.postsynaptic_sources
-            np.ndarray[object]  permanences      = self.postsynaptic_permanences
-            np.ndarray[object]  sources2         = np.empty(self.output_sdr.size, dtype=object)
-            np.ndarray[object]  sinks            = np.empty(self.input_sdr.size,  dtype=object)
-            np.ndarray[object]  sinks2           = np.empty(self.input_sdr.size,  dtype=object)
-            np.ndarray[INDEX_t] sinks_sizes      = np.zeros(self.input_sdr.size,  dtype=INDEX)
-            np.ndarray[INDEX_t] sinks_parts      = np.zeros(self.input_sdr.size,  dtype=INDEX)
-            np.ndarray[object]  sink_perms       = np.empty(self.input_sdr.size, dtype=object)
+            # Source Data Tables
+            np.ndarray[object]  sources       = self.postsynaptic_sources
+            np.ndarray[object]  permanences   = self.postsynaptic_permanences
+            # New Data Tables.
+            np.ndarray[object]  sources2      = np.empty(self.output_sdr.size, dtype=object)
+            np.ndarray[INDEX_t] sources_sizes = np.zeros(self.output_sdr.size, dtype=INDEX)
+            np.ndarray[object]  sinks         = np.empty(self.input_sdr.size,  dtype=object)
+            np.ndarray[object]  sinks2        = np.empty(self.input_sdr.size,  dtype=object)
+            np.ndarray[INDEX_t] sinks_sizes   = np.zeros(self.input_sdr.size,  dtype=INDEX)
+            np.ndarray[INDEX_t] sinks_parts   = np.zeros(self.input_sdr.size,  dtype=INDEX)
+            np.ndarray[object]  sink_perms    = np.empty(self.input_sdr.size,  dtype=object)
             # Inner array pointers
             np.ndarray[INDEX_t]  sources_inner
             np.ndarray[INDEX_t]  sources2_inner
@@ -654,10 +695,11 @@ class SynapseManager:
         # Iterate through every synapse from the output side, build the input
         # side tables.
         for out_idx in range(self.output_sdr.size):
-            sources_inner     = sources[out_idx]
-            perms_inner       = permanences[out_idx]
-            num_sources       = len(sources_inner)
-            sources2[out_idx] = np.full(num_sources, -1, dtype=INDEX)
+            sources_inner          = sources[out_idx]
+            perms_inner            = permanences[out_idx]
+            num_sources            = len(sources_inner)
+            sources_sizes[out_idx] = num_sources
+            sources2[out_idx]      = np.full(num_sources, -1, dtype=INDEX)
             for synapse_num in range(num_sources):
                 inp_idx  = sources_inner[synapse_num]
                 perm_val = perms_inner[synapse_num]
@@ -695,6 +737,7 @@ class SynapseManager:
         self.presynaptic_sinks_sizes        = sinks_sizes
         self.presynaptic_partitions         = sinks_parts
         self.postsynaptic_source_side_index = sources2
+        self.postsynaptic_sources_sizes     = sources_sizes
         if self.weighted:
             self.presynaptic_permanences    = sink_perms
 
@@ -706,6 +749,7 @@ class SynapseManager:
             np.ndarray[object]      sources          = self.postsynaptic_sources
             np.ndarray[object]      sources2         = self.postsynaptic_source_side_index
             np.ndarray[object]      permanences      = self.postsynaptic_permanences
+            np.ndarray[INDEX_t]     sources_sizes    = self.postsynaptic_sources_sizes
             np.ndarray[object]      sinks            = self.presynaptic_sinks
             np.ndarray[object]      sinks2           = self.presynaptic_sink_side_index
             np.ndarray[object]      presyn_perms     = getattr(self, 'presynaptic_permanences', None)
@@ -717,9 +761,9 @@ class SynapseManager:
             np.ndarray[PERMANENCE_t] presyn_perms_inner = None
 
             int out_idx1, out_idx2
-            int inp_idx1, inp_idx2
-            int n_syn
-            int new_sink_sz
+            INDEX_t n_syn
+            INDEX_t inp_idx1, inp_idx2
+            INDEX_t new_sink_sz
             PERMANENCE_t perm_value
 
         # Search for synapses to remove.
@@ -728,7 +772,7 @@ class SynapseManager:
             sources2_inner = <np.ndarray[INDEX_t]>      sources2[out_idx1]
             perms_inner    = <np.ndarray[PERMANENCE_t]> permanences[out_idx1]
 
-            n_syn = sources_inner.shape[0]
+            n_syn = sources_sizes[out_idx1]
 
             out_idx2 = 0
             while out_idx2 < n_syn:
@@ -754,8 +798,7 @@ class SynapseManager:
                     sinks_sizes[inp_idx1] = new_sink_sz
 
                     # Swap this synapse to the end of the postsynaptic/output
-                    # side tables, shorted those tables it at the end of this
-                    # loop.
+                    # side tables.
                     n_syn -= 1
                     _swap_outputs(
                         sources_inner,
@@ -769,12 +812,9 @@ class SynapseManager:
                     # a synapse into the current location.
                     out_idx2 += 1
 
-            # Slice off the deleted synapses from the end of the postsynaptic
-            # tables.
-            if n_syn != sources_inner.shape[0]:
-                sources[out_idx1]     = sources_inner[:n_syn]
-                sources2[out_idx1]    = sources2_inner[:n_syn]
-                permanences[out_idx1] = perms_inner[:n_syn]
+            # Update the logical size of the output tables so that the
+            # removed synapses are effectively gone.
+            sources_sizes[out_idx1] = n_syn
 
     def copy(self):
         """
@@ -844,8 +884,11 @@ class SynapseManager:
 
         for out_idx in range(self.output_sdr.size):
             center         = self.output_location(out_idx)
-            potential_pool = self.postsynaptic_sources[out_idx]
+            potential_size = self.postsynaptic_sources_sizes[out_idx]
+            potential_pool = self.postsynaptic_sources[out_idx][: potential_size]
             pp_locations   = [self.input_location(idx) for idx in potential_pool]
+            if not pp_locations:
+                continue  # No potential synapses, let density == 0
             displacements  = pp_locations - center
 
             # Measure in terms of standard deviations of their distribution.
@@ -869,11 +912,12 @@ class SynapseManager:
         stats = 'Synapse Manager Statistics:\n'
 
         # Build a small table of min/mean/std/max for pre & post, potential &
-        # connected synapse counts (16 values total).
-        postsyn_potential = [pp.shape[0] for pp in self.postsynaptic_sources]
+        # connected synapse counts.
+        postsyn_potential = self.postsynaptic_sources_sizes
+        postsyn_connected = []
         threshold         = PERMANENCE(self.permanence_thresh)
-        postsyn_connected = [np.count_nonzero(pp_perm >= threshold)
-                                for pp_perm in self.postsynaptic_permanences]
+        for pp_perm, pp_sz in zip(self.postsynaptic_permanences, postsyn_potential):
+            postsyn_connected.append(np.count_nonzero(pp_perm[ : pp_sz] >= threshold))
         entries = [
             ("Potential Synapses per Input ", self.presynaptic_sinks_sizes),
             ("Connected Synapses per Input ", self.presynaptic_partitions),
@@ -910,11 +954,12 @@ class SynapseManager:
             pp_density_1, pp_density_2, pp_density_3 = self.measure_potential_pool_densities()
             stats += 'Potential Pool Density 1/2/3: {:5g} / {:5g} / {:5g}\n'.format(
                 pp_density_1, pp_density_2, pp_density_3,)
-        # else:
-        #     avg_pp_size = sum(len(pp) for pp in self.postsynaptic_sources)
-        #     avg_pp_size = avg_pp_size / self.output_sdr.size
-        #     pp_density  = avg_pp_size / self.input_sdr.size
-        #     stats += 'Potential Pool Density {:5g}\n'.format(pp_density)
+
+            pp_mask = [np.count_nonzero(area) for area in self.postsynaptic_source_distributions]
+            max_pp  = np.max(pp_mask)
+            avg_pp  = np.mean(pp_mask)
+            min_pp  = np.min(pp_mask)
+            stats += 'Maximum Potential Pool Size Max/Avg/Min %d / %d / %d\n'%(max_pp, int(round(avg_pp)), min_pp,)
 
         return stats
 
@@ -935,17 +980,19 @@ class SynapseManager:
             sources1_inner = self.postsynaptic_sources[out_idx1]
             sources2_inner = self.postsynaptic_source_side_index[out_idx1]
             permanences    = self.postsynaptic_permanences[out_idx1]
+            sources_size   = self.postsynaptic_sources_sizes[out_idx1]
             # Check table size and type.
             assert(len(sources1_inner.shape) == 1)
             assert(sources1_inner.shape == sources2_inner.shape)
             assert(sources1_inner.shape == permanences.shape)
+            assert(sources_size <= sources1_inner.shape[0])
             assert(sources1_inner.dtype == INDEX)
             assert(sources2_inner.dtype == INDEX)
             assert(permanences.dtype == PERMANENCE)
-            assert(np.all(permanences >= 0.))
-            assert(np.all(permanences <= 1.))
+            assert(np.all(permanences[ : sources_size] >= 0.))
+            assert(np.all(permanences[ : sources_size] <= 1.))
             # Check Output -> Input linkage.
-            for out_idx2 in range(sources1_inner.shape[0]):
+            for out_idx2 in range(sources_size):
                 inp_idx1 = sources1_inner[out_idx2]
                 inp_idx2 = sources2_inner[out_idx2]
                 assert(inp_idx2 < self.presynaptic_sinks_sizes[inp_idx1])
@@ -986,6 +1033,7 @@ class SynapseManager:
             for inp_idx2 in range(sinks_size):
                 out_idx1 = sinks1_inner[inp_idx2]
                 out_idx2 = sinks2_inner[inp_idx2]
+                assert(out_idx2 < self.postsynaptic_sources_sizes[out_idx1])
 
                 sources1_inner = self.postsynaptic_sources[out_idx1]
                 sources2_inner = self.postsynaptic_source_side_index[out_idx1]
@@ -1090,6 +1138,7 @@ cdef _find_min_perm_synapses(
     int                      n_synapses,
     np.ndarray[INDEX_t]      sources_inner,
     np.ndarray[PERMANENCE_t] permanences_inner,
+    INDEX_t                  sources_size,
     np.ndarray[INDEX_t]      exclude_sources,):
     """
     Returns an array of indicies into the given sources list.
@@ -1099,7 +1148,10 @@ cdef _find_min_perm_synapses(
         np.ndarray[INDEX_t]      candidate_out_idx2
         np.ndarray[PERMANENCE_t] candidate_permanences
 
-    candidate_out_idx2 = np.arange(sources_inner.shape[0], dtype=INDEX)
+    sources_inner     = sources_inner[ : sources_size]
+    permanences_inner = permanences_inner[ : sources_size]
+
+    candidate_out_idx2 = np.arange(sources_size, dtype=INDEX)
 
     include_sources_mask = np.in1d(
         sources_inner,
@@ -1124,14 +1176,15 @@ cdef _remove_synapse(
     np.ndarray[object]  sources,
     np.ndarray[object]  sources2,
     np.ndarray[object]  perms,
+    np.ndarray[INDEX_t] sources_sizes,
     np.ndarray[object]  sinks,
     np.ndarray[object]  sinks2,
     np.ndarray[object]  presyn_perms,
     np.ndarray[INDEX_t] sink_parts,
     np.ndarray[INDEX_t] sink_sizes,
+    PERMANENCE_t        permanence_thresh,
     int                 out_idx1,
-    int                 out_idx2,
-    PERMANENCE_t        permanence_thresh,):
+    int                 out_idx2,):
     cdef:
         # Inner data tables.
         np.ndarray[INDEX_t] sources_inner    = sources[out_idx1]
@@ -1179,8 +1232,8 @@ cdef _remove_synapse(
         inp_idx2_swap,)
     sink_sizes[inp_idx1] -= 1
 
-    # Swap to end of output data tables
-    out_idx2_swap = sources_inner.shape[0] - 1
+    # Swap to end of output data tables and decrement the data tables logical size.
+    out_idx2_swap = sources_sizes[out_idx1] - 1
     _swap_outputs(
         sources_inner,
         sources2_inner,
@@ -1188,11 +1241,7 @@ cdef _remove_synapse(
         sinks2,
         out_idx2,
         out_idx2_swap,)
-
-    # Truncate output data tables.
-    sources[out_idx1]  = sources_inner[:-1]
-    sources2[out_idx1] = sources2_inner[:-1]
-    perms[out_idx1]    = perms_inner[:-1]
+    sources_sizes[out_idx1] -= 1
 
 def _setup_topology(input_dimensions, output_dimensions, radii,):
     """
@@ -1251,6 +1300,12 @@ def _setup_topology(input_dimensions, output_dimensions, radii,):
                 multivariate_src_dist = src_dist
             else:
                 multivariate_src_dist = np.outer(multivariate_src_dist, src_dist)
+
+        # Normalize such that the sum is 1.
+        multivariate_src_dist /= np.sum(multivariate_src_dist)
+        # Filter out inputs which have a very low probability of activating.
+        remove_potential_connections = multivariate_src_dist < 1e-5
+        multivariate_src_dist[remove_potential_connections] = 0.
 
         output_source_distributions[out_topo_idx] = multivariate_src_dist
     return output_locations, output_source_distributions

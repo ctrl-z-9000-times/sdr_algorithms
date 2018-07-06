@@ -17,7 +17,7 @@ def _binary_entropy(p):
     return np.mean(np.nan_to_num(s))
 
 
-class SparseDistributedRepresentation:
+class SparseDistributedRepresentation(object):
     """
     This class represents both the specification and the momentary value of a
     Sparse Distributed Representation.  Classes initialized with SDRs can expect
@@ -48,12 +48,20 @@ class SparseDistributedRepresentation:
               sdr.index and sdr.flat_index.  Defaults to all ones.
     """
     def __init__(self, specification,
-        activation_frequency_alpha=None,
-        average_overlap_alpha=None):
+        dense = None,
+        index = None,
+        flat_index = None,
+        nz_values = None,
+        activation_frequency_alpha = None,
+        average_overlap_alpha = None):
         """
         Argument specification can be either one of the following:
             A tuple of numbers, which declares the dimensions.
             An SDR, which makes this instance a shallow copy of it.
+
+        Optional Arguments dense, index, flat_index, nz_values.  If given these
+            are assigned into their respective attributes.  This is a
+            convenience so that SDRs can be created and initialized in one line.
 
         Optional Argument activation_frequency_alpha.  If given, this SDR will
             automatically track the moving exponential average of each bits
@@ -76,9 +84,19 @@ class SparseDistributedRepresentation:
             feature entirely, it is OFF by default.  Attribute
             sdr.average_overlap contains the output, type=float, range=[0, 1].
         """
+        # Check arguments.
+        num_initializers = sum((
+                    isinstance(specification, SDR),
+                    dense is not None,
+                    index is not None,
+                    flat_index is not None,))
+        if num_initializers > 1:
+            raise TypeError("SDR's can only have one initializer.")
+
         # Private attribute self._callbacks is a list of functions of self, all
         # of which are called each time this SDR's value changes.
         self._callbacks = []
+
         if isinstance(specification, SDR):
             self.dimensions = specification.dimensions
             self.size       = specification.size
@@ -87,6 +105,15 @@ class SparseDistributedRepresentation:
             self.dimensions = tuple(int(round(x)) for x in specification)
             self.size       = np.product(self.dimensions)
             self.zero()
+
+        if dense is not None:
+            self.dense = dense
+        if index is not None:
+            self.index = index
+        if flat_index is not None:
+            self.flat_index = flat_index
+        if nz_values is not None:
+            self.nz_values = nz_values
 
         if activation_frequency_alpha is not None:
             self.activation_frequency_alpha = activation_frequency_alpha
@@ -157,7 +184,7 @@ class SparseDistributedRepresentation:
     def flat_index(self, value):
         assert(isinstance(value, np.ndarray))
         assert(len(value.shape) == 1)
-        assert(value.dtype == np.int64 or value.dtype == np.int32)
+        assert(value.dtype in (np.int64, np.int32, np.uint64, np.uint32,))
         self._dense      = None
         self._index      = None
         self._flat_index = value
@@ -175,10 +202,11 @@ class SparseDistributedRepresentation:
         return self._nz_values
     @nz_values.setter
     def nz_values(self, value):
-        assert(self._dense is None)
         assert(isinstance(value, np.ndarray))
         assert(value.shape == (len(self),))
         assert(value.dtype.itemsize == 1)
+        self.flat_index    # Force this to exist.
+        self._dense = None # This needs to be updated.
         self._nz_values       = value
         self._nz_values.dtype = np.uint8
 
@@ -231,11 +259,17 @@ class SparseDistributedRepresentation:
         return len(self.flat_index)
 
     def zero(self):
-        """Sets all bits in the current sdr to zero."""
+        """
+        Sets all bits in the current sdr to zero.  Used for reseting things.
+        This does NOT call sdr._handle_callbacks(), so activation frequency is
+        not changed and this resets average overlap's memory.
+        """
         self._dense      = None
         self._index      = None
         self._flat_index = np.empty(0, dtype=np.int)
         self._nz_values  = None
+        if hasattr(self, "_prev_value"):
+            self._prev_value.zero()
 
     def _track_activation_frequency(self):
         alpha = self.activation_frequency_alpha
@@ -312,11 +346,11 @@ class SparseDistributedRepresentation:
         other.assign(other_sdr)
         total_bits = np.sum(self.nz_values) + np.sum(other.nz_values)
         if total_bits == 0:
-            return 0
+            return 0.
         diff_bits  = np.array(self.dense, dtype=np.int)
         diff_bits -= other.dense
         diff_bits  = np.sum(np.abs(diff_bits))
-        return (total_bits - diff_bits) / total_bits
+        return (total_bits - diff_bits) / float(total_bits)
 
     def false_positive_rate(self, active_sample_size, overlap_threshold):
         """
@@ -456,7 +490,8 @@ class SparseDistributedRepresentation:
         stats = 'SDR%s\n'%str(self.dimensions)
 
         if hasattr(self, 'average_overlap'):
-            stats += '\tAverage Overlap %g\n'%self.average_overlap
+            ovlp  = 100 * self.average_overlap
+            stats += '\tAverage Overlap %g%%\n'%ovlp
 
         if hasattr(self, 'activation_frequency'):
             af = self.activation_frequency
@@ -475,33 +510,58 @@ class SparseDistributedRepresentation:
 SDR = SparseDistributedRepresentation
 
 
-# TODO: Instead of calling assign-flat-concat, make and use this class
-#   First write the docstrings for it...
 class SDR_Concatenation(SDR):
     """
+    Combines a set of SDRs into a single monolithic SDR.
 
     SDR concatenations are read only.  To change its value assign to any of the
     component SDRs.  This SDRs value is computed and cached when it is accessed.
     """
-    def __init__(self, concat_sdrs, axis=None):
+    def __init__(self, concat_sdrs, axis=None, **kw_args):
         """
+        Argument concat_sdrs is an iterable of SDRs.
+
+        Optional argument axis is an integer.  All dimensions except the
+            concatenation axis must be the same.  By default axis is None, which
+            causes all input SDRs to be flattened and concatenated along axis 0.
+
         """
-        self.input_sdrs = tuple(concat_sdrs)
-        assert(all(isinstance(x, SDR) for x in self.input_sdrs))
-        concat_dim = sum(sdr.dimensions[axis] for sdr in self.input_sdrs)
-        # assert(all(dims are ok excpt for axis which can be anything...))
-        self.size = sum(x.size for x in self._concat_sdrs)
-        self.dimensions = 1/0
-        self.valid = False
-        for sdr in self._concat_sdrs:
+        self.concat_sdrs = tuple(concat_sdrs)
+        assert(all(isinstance(x, SDR) for x in self.concat_sdrs))
+        assert(len(self.concat_sdrs) > 0)
+        for sdr in self.concat_sdrs:
             sdr._callbacks.append(self._callback)
 
+        self.axis = axis
+        if self.axis is not None:
+            concat_dims = [sdr.dimensions for sdr in self.concat_sdrs]
+            dimensions = []
+            for axis, dim_vector in enumerate(zip(concat_dims)):
+                if axis == self.axis:
+                    concat_dim = sum(dim_vector)
+                    dimensions
+                else:
+                    dim_size = dim_vector[0]
+                    assert(all(d == dim_size for d in dim_vector))
+                    dimensions.append(dim_size)
+            # assert(all(dims are ok excpt for axis which can be anything...))
+            concat_dim = sum(sdr.dimensions[axis] for sdr in self.concat_sdrs)
+            dimensions = tuple(dimensions)
+        else:
+            dimensions = (sum(sdr.size for sdr in self.concat_sdrs),)
+
+        SDR.__init__(self, dimensions, **kw_args)
+
     def _callback(self):
-        self.valid = False
+        self._dense = None
+        self._index = None
+        self._flat_index = None
+        self._nz_values = None
 
     @property
     def dense(self):
         if self._dense is None:
+            # Attempt to convert to dense from an alternate format.
             nz_values = self.nz_values
             if self._flat_index is not None:
                 self._dense = np.zeros(self.size, dtype=np.uint8)
@@ -510,36 +570,96 @@ class SDR_Concatenation(SDR):
             elif self._index is not None:
                 self._dense = np.zeros(self.dimensions, dtype=np.uint8)
                 self._dense[self.index] = nz_values
+            else:
+                # Compute this SDRs value from the constituent SDRs.
+                dense_sdrs = [sdr.dense for sdr in self.concat_sdrs]
+                if self.axis is None:
+                    dense_sdrs = [sdr.reshape(-1) for sdr in dense_sdrs]
+                    self._dense = np.concatenate(dense_sdrs)
+                else:
+                    self._dense = np.concatenate(dense_sdrs, axis=self.axis)
+                self._handle_callbacks()
         return self._dense
 
     @property
     def index(self):
         if self._index is None:
+            # Attempt to convert to index from an alternative format.
             if self._flat_index is not None:
                 self._index = np.unravel_index(self._flat_index, self.dimensions)
             elif self._dense is not None:
                 self._index = np.nonzero(self._dense)
+            else:
+                # Compute this SDR from its constituent SDRs.
+                if self.axis is not None:
+                    self._compute_index()
+                else:
+                    # Can not directly compute index, compute flat_index first
+                    # and then index from it.
+                    self.flat_index
+                    self.index
         return self._index
+
+    def _compute_index(self):
+        """ Compute this SDRs value from sdr.concat_sdrs.  Only use this if
+        sdr.axis is not None. """
+        assert(self.axis is not None)
+        index = []
+        idx_sdr = [sdr.index for sdr in self.concat_sdrs]
+        for idx_dim in zip(*idx_sdr):
+            idx = np.concatenate(idx_dim)
+            index.append(idx)
+
+        concat_axis_index = index[self.axis]
+        sdr_offset = 0      # Offset into concat axis of SDR.
+        idx_offset = 0      # Offset into this index array.
+        for sdr in self.concat_sdrs:
+            concat_axis_index[idx_offset : idx_offset + len(sdr)] += sdr_offset
+            idx_offset += len(sdr)
+            sdr_offset += sdr.dimensions[self.axis]
+        self._index = tuple(index)
+        self._handle_callbacks()
 
     @property
     def flat_index(self):
         if self._flat_index is None:
+            # Try to convert the current value from another format.
             if self._index is not None:
                 self._flat_index = np.ravel_multi_index(self._index, self.dimensions)
             elif self._dense is not None:
                 self._flat_index = np.nonzero(self._dense.reshape(-1))[0]
+            else:
+                if self.axis is None:
+                    self._compute_flat_index()
+                else:
+                    # Can not compute flat_index with topology enabled.  Convert
+                    # to index first, then to flat_index.
+                    self.index
+                    self.flat_index
         return self._flat_index
+
+    def _compute_flat_index(self):
+        """ Compute this SDRs value.  Only call this if sdr.axis is None. """
+        assert(self.axis is None)
+        sdrs = [sdr.flat_index for sdr in self.concat_sdrs]
+        self._flat_index = np.concatenate(sdrs)
+        sdr_offset = 0      # Offset into final concat'd SDR.
+        idx_offset = 0      # Offset into this flat_index array.
+        for sdr in self.concat_sdrs:
+            idx_len = sdr.flat_index.shape[0]
+            self._flat_index[idx_offset : idx_offset + idx_len] += sdr_offset
+            sdr_offset += sdr.size
+            idx_offset += idx_len
+        self._handle_callbacks()
 
     @property
     def nz_values(self):
         if self._nz_values is None:
-            dense = self._dense
-            if dense is not None:
-                dense.shape = -1
-                self._nz_values  = dense[self.flat_index]
-                dense.shape = self.dimensions
+            if self._dense is not None:
+                self._nz_values = self._dense.reshape(-1)[self.flat_index]
             else:
-                self._nz_values = np.ones(len(self), dtype=np.uint8)
+                nz_sdrs = [sdr.nz_values for sdr in self.concat_sdrs]
+                self._nz_values = np.concatenate(nz_sdrs)
         return self._nz_values
 
 
