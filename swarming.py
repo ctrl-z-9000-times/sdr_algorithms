@@ -20,6 +20,10 @@ Usage:
 $ swarming.py [swarming arguments] ExperimentModule.py [experiment arguments]
 """
 
+# TODO: main(debug) could be more aptly named verbose.
+
+# TODO: Add CLI argument for a process time limit?
+
 import argparse
 import sys
 import os
@@ -27,6 +31,7 @@ import random
 import pprint
 import time
 import multiprocessing
+import resource
 
 # TODO: Deal with global constants: particle_strength, global_strength, velocity_strength
 #       Maybe make them into CLI Arguments?
@@ -76,10 +81,10 @@ def initial_parameters(default_parameters):
         return tuple(initial_parameters(value) for value in default_parameters)
     # Calculate good initial values.
     elif isinstance(default_parameters, float):
-        return default_parameters * 1.5 ** (random.random()*2-1)
+        return default_parameters * 1.25 ** (random.random()*2-1)
     elif isinstance(default_parameters, int):
         if abs(default_parameters) < 10:
-            return default_parameters + random.choice([-1, +1])
+            return default_parameters + random.choice([-1, 0, +1])
         else:
             initial_value_float = initial_parameters(float(default_parameters))
             return int(round(initial_value_float))
@@ -93,16 +98,15 @@ def initial_velocity(default_parameters):
         return tuple(initial_velocity(value) for value in default_parameters)
     # Calculate good initial velocities.
     elif isinstance(default_parameters, float):
-        max_percent_change = 20
+        max_percent_change = 10
         uniform = 2 * random.random() - 1
         return default_parameters * uniform * (max_percent_change / 100.)
     elif isinstance(default_parameters, int):
         if abs(default_parameters) < 10:
             uniform = 2 * random.random() - 1
-            return default_parameters + uniform
+            return uniform
         else:
-            initial_velocity_float = initial_velocity(float(default_parameters))
-            return initial_velocity_float
+            return initial_velocity(float(default_parameters))
 
 def initialize_particle_swarm(default_parameters, num_particles):
     swarm_data = {}
@@ -164,6 +168,8 @@ if __name__ == '__main__':
         help='Name of experiment module followed by its command line arguments.')
     args = arg_parser.parse_args()
     assert(args.particles >= args.processes)
+    memory_limit = int((12e9 - 1.5e9) / args.processes)
+    print("Memory Limit %g GB per instance."%(memory_limit / 1e9))
 
     # Load the experiment module.
     experiment_file = args.experiment[0]
@@ -182,6 +188,8 @@ if __name__ == '__main__':
         return parameters, score
 
     def evaluate_particle(particle_data):
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, hard))
         parameters = typecast_parameters(particle_data['value'], parameter_structure)
         eval_str = ('%s.main(parameters=%s, argv=[%s], debug=False)'%(
                     experiment_module,
@@ -273,14 +281,18 @@ if __name__ == '__main__':
                 particle_data = swarm_data[particle_number]
                 try:
                     score = promise.get()
-                except ValueError as err:
+                except (ValueError, MemoryError) as err:
                     print("")
                     print("Particle Number %d"%particle_number)
                     pprint.pprint(particle_data['value'])
-                    print("ValueError:", err)
+                    print("%s:"%(type(err).__name__), err)
                     print("")
-                    # TODO: Consider replacing this particle with the best
-                    # particle and a new random velocity.
+                    # TODO: Consider replacing this particle with (in order of
+                    # preference, but tolerating Nones):
+                    #   1) particle best,
+                    #   2) global best,
+                    #   3) new particle from defaults.
+                    # In all cases give new random velocity.
                     continue
                 except Exception:
                     print("")
@@ -291,10 +303,11 @@ if __name__ == '__main__':
                 if particle_data['best_score'] is None or score > particle_data['best_score']:
                     particle_data['best']       = particle_data['value']
                     particle_data['best_score'] = score
+                    print("New particle best score %g"%particle_data['best_score'])
                 if swarm_data['best_score'] is None or score > swarm_data['best_score']:
                     swarm_data['best']       = typecast_parameters(particle_data['best'], parameter_structure)
                     swarm_data['best_score'] = particle_data['best_score']
-                    print("New best score %g"%swarm_data['best_score'])
+                    print("New global best score %g"%swarm_data['best_score'])
 
                 # Save the swarm to file.
                 swarm_data['evals'] += 1
