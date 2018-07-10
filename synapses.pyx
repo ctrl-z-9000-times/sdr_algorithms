@@ -52,6 +52,16 @@ class SynapseManager:
         postsnyaptic_sources entry.  The postsynaptic tables are allocated with
         extra room at the end for fast adding and removing synapses.
 
+    Attribute postsynaptic_connected_count
+        postsynaptic_connected_count[output-index] = The number of synapses
+        which connect to this output site.  Values in this table can be computed
+        with the following code snippet:
+            output-index = 1234
+            output-size  = sm.postsynaptic_sources_sizes[output-index]
+            permanences  = sm.postsynaptic_permanences[ : output-size]
+            connected    = permanences >= sm.permanence_thresh
+            postsynaptic_connected_count[output-index] = np.count_nonzero(connected)
+
     Attributes presynaptic_sinks, presynaptic_sinks_sizes
         presynaptic_sinks[input-index] = 1D array of potential output indices.
         The sinks table is associates each input (presynapse) with its outputs
@@ -106,6 +116,8 @@ class SynapseManager:
         sm.postsynaptic_sources.dtype == INDEX, index into input space.
 
         sm.postsynaptic_sources_sizes.dtype == INDEX
+
+        sm.postsynaptic_connected_count.dtype == INDEX
 
         sm.postsynaptic_source_side_index.dtype == INDEX, maximum number of 
             outputs which an input could connect to, size of output space.
@@ -310,7 +322,8 @@ class SynapseManager:
     @cython.profile(DEBUG)
     def learn(self, input_sdr=None, output_sdr=None,
         permanence_inc = None,
-        permanence_dec = None,):
+        permanence_dec = None,
+        prev_updates   = None,):
         """
         Update the permanences of active outputs using the most recently given
         inputs.
@@ -327,6 +340,8 @@ class SynapseManager:
 
         Optional Arguments permanence_inc and permanence_dec take precedence
            over any value passed to this classes initialize method.
+
+       Optional Argument prev_updates ...
         """
         self.input_sdr.assign(input_sdr)
         self.output_sdr.assign(output_sdr)
@@ -336,6 +351,7 @@ class SynapseManager:
             np.ndarray[object]      sources2         = self.postsynaptic_source_side_index
             np.ndarray[object]      permanences      = self.postsynaptic_permanences
             np.ndarray[INDEX_t]     sources_sizes    = self.postsynaptic_sources_sizes
+            np.ndarray[INDEX_t]     connected_counts = self.postsynaptic_connected_count
             np.ndarray[object]      sinks            = self.presynaptic_sinks
             np.ndarray[object]      sinks2           = self.presynaptic_sink_side_index
             np.ndarray[object]      presyn_perms     = getattr(self, 'presynaptic_permanences', None)
@@ -356,8 +372,15 @@ class SynapseManager:
             INDEX_t partition
             np.uint8_t input_value
             PERMANENCE_t perm_value
+            PERMANENCE_t perm_delta
             PERMANENCE_t inc, dec, thresh = self.permanence_thresh
             bint syn_prior, syn_post
+
+            # Correlate input learning stuff.
+            np.ndarray[object] _prev_updates   = prev_updates
+            np.ndarray[object] current_updates = np.full(self.output_sdr.size, None)
+            np.ndarray[PERMANENCE_t] prev_update_row = None
+            np.ndarray[PERMANENCE_t] current_update_row
 
         # Arguments override initialized or default values.
         inc = permanence_inc if permanence_inc is not None else self.permanence_inc
@@ -373,6 +396,11 @@ class SynapseManager:
             perms_inner      = <np.ndarray[PERMANENCE_t]> permanences[out_idx1]
             out_size         = sources_sizes[out_idx1]
 
+            if _prev_updates is not None:
+                prev_update_row = _prev_updates[out_idx1]
+                current_update_row = np.zeros(out_size, dtype=PERMANENCE)
+                current_updates[out_idx1] = current_update_row
+
             for out_idx2 in range(out_size):
                 inp_idx1     = sources_inner[out_idx2]
                 perm_value   = perms_inner[out_idx2]
@@ -380,9 +408,17 @@ class SynapseManager:
                 # Hebbian Learning.
                 input_value  = input_activity[inp_idx1]
                 if input_value != 0:
-                    perm_value += inc
+                    perm_delta = inc
                 else:
-                    perm_value -= dec
+                    perm_delta = -dec
+
+                if prev_update_row is not None:
+                    # Update the current learning updates.
+                    current_update_row[out_idx2] = perm_delta
+                    # Subtract away the previous learning updates 
+                    perm_delta -= prev_update_row[out_idx2]
+
+                perm_value += perm_delta
                 # Clip permanence to [0, 1]
                 if perm_value > 1.:
                     perm_value = 1.
@@ -406,11 +442,15 @@ class SynapseManager:
                         # segment and increment the partition over it.
                         inp_idx2_swap = partition
                         sinks_parts[inp_idx1] += 1
+                        # Book keeping, one more connected synapse to this output site.
+                        connected_counts[out_idx1] += 1
                     else:
                         # Swap this synapse to the end of the connected segment
                         # and decrement the partition over of.
                         inp_idx2_swap = partition - 1
                         sinks_parts[inp_idx1] -= 1
+                        # Book keeping, one fewer connected synapse to this output site.
+                        connected_counts[out_idx1] -= 1
 
                     _swap_inputs(
                         <np.ndarray[INDEX_t]> sinks[inp_idx1],
@@ -419,6 +459,7 @@ class SynapseManager:
                         sources2,
                         inp_idx2,
                         inp_idx2_swap)
+        return current_updates
 
     # TODO: Compute maximum_new_synapses locally.
     @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
@@ -672,6 +713,7 @@ class SynapseManager:
             # New Data Tables.
             np.ndarray[object]  sources2      = np.empty(self.output_sdr.size, dtype=object)
             np.ndarray[INDEX_t] sources_sizes = np.zeros(self.output_sdr.size, dtype=INDEX)
+            np.ndarray[INDEX_t] con_counts    = np.zeros(self.output_sdr.size, dtype=INDEX)
             np.ndarray[object]  sinks         = np.empty(self.input_sdr.size,  dtype=object)
             np.ndarray[object]  sinks2        = np.empty(self.input_sdr.size,  dtype=object)
             np.ndarray[INDEX_t] sinks_sizes   = np.zeros(self.input_sdr.size,  dtype=INDEX)
@@ -704,6 +746,8 @@ class SynapseManager:
                 inp_idx  = sources_inner[synapse_num]
                 perm_val = perms_inner[synapse_num]
                 assert(perm_val >= 0. and perm_val <= 1.)
+                if perm_val >= thresh:
+                    con_counts[out_idx] += 1
                 sinks[inp_idx].append(out_idx)
                 sinks2[inp_idx].append(synapse_num)
                 sink_perms[inp_idx].append(perm_val)
@@ -738,8 +782,10 @@ class SynapseManager:
         self.presynaptic_partitions         = sinks_parts
         self.postsynaptic_source_side_index = sources2
         self.postsynaptic_sources_sizes     = sources_sizes
+        self.postsynaptic_connected_count   = con_counts
         if self.weighted:
             self.presynaptic_permanences    = sink_perms
+
 
     @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
     @cython.wraparound(False)  # Turns off negative index wrapping for entire function.
@@ -971,6 +1017,7 @@ class SynapseManager:
         Checks that input -> output and output -> input yields the same connection.
         Checks that presyn_parts is okay.
         Checks that presyn_sizes is okay.
+        Checks that postsyn_connected_counts is okay.
         Checks that all perms in range [0, 1]
         Checks that presyn-perms == postsyn-perms
         """
@@ -981,6 +1028,7 @@ class SynapseManager:
             sources2_inner = self.postsynaptic_source_side_index[out_idx1]
             permanences    = self.postsynaptic_permanences[out_idx1]
             sources_size   = self.postsynaptic_sources_sizes[out_idx1]
+            con_count      = self.postsynaptic_connected_count[out_idx1]
             # Check table size and type.
             assert(len(sources1_inner.shape) == 1)
             assert(sources1_inner.shape == sources2_inner.shape)
@@ -991,6 +1039,7 @@ class SynapseManager:
             assert(permanences.dtype == PERMANENCE)
             assert(np.all(permanences[ : sources_size] >= 0.))
             assert(np.all(permanences[ : sources_size] <= 1.))
+            assert(con_count == np.count_nonzero(permanences >= self.permanence_thresh))
             # Check Output -> Input linkage.
             for out_idx2 in range(sources_size):
                 inp_idx1 = sources1_inner[out_idx2]
@@ -1039,11 +1088,11 @@ class SynapseManager:
                 sources2_inner = self.postsynaptic_source_side_index[out_idx1]
                 assert(sources1_inner[out_idx2] == inp_idx1)
                 assert(sources2_inner[out_idx2] == inp_idx2)
-                permanece = self.postsynaptic_permanences[out_idx1][out_idx2]
+                permanence = self.postsynaptic_permanences[out_idx1][out_idx2]
                 if presyn_perms is not None:
-                    assert(presyn_perms_inner[inp_idx2] == permanece)
+                    assert(presyn_perms_inner[inp_idx2] == permanence)
                 # Check partition
-                if permanece >= self.permanence_thresh:
+                if permanence >= self.permanence_thresh:
                     assert(inp_idx2 < partition)
                 else:
                     assert(inp_idx2 >= partition)

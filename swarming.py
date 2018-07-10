@@ -12,7 +12,7 @@ To use this module, structure experiments as follows:
     Parameters must be one of the following types: dict, tuple, float, int.
     Parameters can be nested in multiple levels of dictionaries and tuples.
 
-    ExperimentModule.main(parameters=default_parameters, argv=None, debug=True)
+    ExperimentModule.main(parameters=default_parameters, argv=None, verbose=True)
     Returns (float) performance of parameters, to be maximized.  Debug is set to
     False when running particle swarm optimization.
 
@@ -20,9 +20,14 @@ Usage:
 $ swarming.py [swarming arguments] ExperimentModule.py [experiment arguments]
 """
 
-# TODO: main(debug) could be more aptly named verbose.
-
 # TODO: Add CLI argument for a process time limit?
+# TODO: Add CLI argument for a process memory limit?
+
+# TODO: Deal with global constants: particle_strength, global_strength, velocity_strength
+#       Maybe make them into CLI Arguments?
+
+# TODO: When an evaluation raises a ValueError or MemoryError replace the
+# particles current value, velocity, and continue.
 
 import argparse
 import sys
@@ -33,12 +38,9 @@ import time
 import multiprocessing
 import resource
 
-# TODO: Deal with global constants: particle_strength, global_strength, velocity_strength
-#       Maybe make them into CLI Arguments?
 particle_strength   = .1
 global_strength     = .1
 velocity_strength   = .9
-
 
 def parameter_types(default_parameters):
     """
@@ -156,14 +158,16 @@ def update_particle_velocity(postition, velocity, particle_best, global_best):
         global_bias   = (global_best - postition)   * global_strength   * random.random()
         return velocity * velocity_strength + particle_bias + global_bias
 
-
 if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument('--best', action='store_true',
-        help='Evaluate the best set of parameters on file, with debug=True.')
+        help='Evaluate the best set of parameters on file, with verbose=True.')
     arg_parser.add_argument('-n', '--processes',  type=int, default=os.cpu_count(),)
     arg_parser.add_argument('-p', '--particles',  type=int, default=10,
         help='Size of swarm, number of particles to use.')
+    arg_parser.add_argument('--clear_scores', action='store_true',
+        help=('Remove all scores from the particle swarm so that the '
+              'experiment can be safely altered.'))
     arg_parser.add_argument('experiment', nargs=argparse.REMAINDER,
         help='Name of experiment module followed by its command line arguments.')
     args = arg_parser.parse_args()
@@ -182,7 +186,7 @@ if __name__ == '__main__':
     default_parameters = eval('%s.default_parameters'%experiment_module)
     parameter_structure = parameter_types(default_parameters)
 
-    def evaluate_parameters(parameters, debug):
+    def evaluate_parameters(parameters, verbose):
         # This would have been a more useful function to have, in retrospect.
         1/0
         return parameters, score
@@ -191,7 +195,7 @@ if __name__ == '__main__':
         _, hard = resource.getrlimit(resource.RLIMIT_AS)
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit, hard))
         parameters = typecast_parameters(particle_data['value'], parameter_structure)
-        eval_str = ('%s.main(parameters=%s, argv=[%s], debug=False)'%(
+        eval_str = ('%s.main(parameters=%s, argv=[%s], verbose=False)'%(
                     experiment_module,
                     repr(parameters),
                     ', '.join("'%s'"%arg for arg in args.experiment[1:]),))
@@ -234,12 +238,22 @@ if __name__ == '__main__':
         print("Evaluating best parameters.")
         print("Score:", swarm_data['best_score'])
         pprint.pprint(swarm_data['best'])
-        eval_str = ('%s.main(parameters=%s, argv=[%s], debug=True)'%(
+        eval_str = ('%s.main(parameters=%s, argv=[%s], verbose=True)'%(
                     experiment_module,
                     repr(swarm_data['best']),
                     ', '.join("'%s'"%arg for arg in args.experiment[1:]),))
         score = eval(eval_str)
         print("Score:", score)
+        sys.exit()
+
+    if args.clear_scores:
+        print("Removing Scores from Particle Swarm File %s."%swarm_path)
+        swarm_data['best_score'] = None
+        for entry in swarm_data:
+            if isinstance(entry, int):
+                swarm_data[entry]['best_score'] = None
+        with open(swarm_path, 'w') as swarm_file:
+            pprint.pprint(swarm_data, stream = swarm_file)
         sys.exit()
 
     # Run the particle swarm optimization.
@@ -303,7 +317,7 @@ if __name__ == '__main__':
                 if particle_data['best_score'] is None or score > particle_data['best_score']:
                     particle_data['best']       = particle_data['value']
                     particle_data['best_score'] = score
-                    print("New particle best score %g"%particle_data['best_score'])
+                    print("New particle (%d) best score %g"%(particle_number, particle_data['best_score']))
                 if swarm_data['best_score'] is None or score > swarm_data['best_score']:
                     swarm_data['best']       = typecast_parameters(particle_data['best'], parameter_structure)
                     swarm_data['best_score'] = particle_data['best_score']

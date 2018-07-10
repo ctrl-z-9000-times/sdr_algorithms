@@ -1,4 +1,4 @@
-# Written by David McDougall, 2018
+"""Written by David McDougall, 2018"""
 
 import numpy as np
 from sdr import SDR
@@ -6,7 +6,7 @@ from synapses import SynapseManager
   
 # TODO: Make a parameter "diagnostics_alpha" for measuring mini-column
 # activation frequency and average overlap insead of using "boosting_alpha".
-#
+
 class SpatialPooler:
     """
     This class handles the mini-column structures and the feed forward 
@@ -24,27 +24,21 @@ class SpatialPooler:
     poolers.
     """
     def __init__(self,
+        input_sdr,
         mini_columns,     # Integer,
         sparsity,
         potential_pool,
         permanence_inc,
         permanence_dec,
         permanence_thresh,
-        input_sdr,
-        segments            = 1,         # Integer, proximal segments per minicolumns
+        segments            = 1,
         macro_columns       = (1,),
         init_dist           = (0, 0),
         boosting_alpha      = None,
         active_thresh       = 0,
-        min_stability       = None,
-        max_add_synapses    = None,    # Fraction of synapses needed for activation to add. Range [0, 1]
-        min_add_synapses    = None,    # Target excitement level, add at least this many synapses. Integer
-        matching_thresh     = None,
         radii               = tuple()):
         """
-        Argument parameters is an instance of SpatialPoolerParameters.
-
-        Argument mini_columns is the number of mini-columns in each 
+        Argument mini_columns is an Integer, the number of mini-columns in each 
             macro-column.
 
         Argument macro_columns is a tuple of integers.  Dimensions of macro
@@ -54,7 +48,7 @@ class SpatialPooler:
         Optional Argument radii defines the input topology.  Trailing extra
             input dimensions are treated as non-topological dimensions.
 
-        Argument segments is the number of coincidence detectors to make for each
+        Argument segments is an Integer, number proximal segments for each
             mini-column.
 
         Argument sparsity ...
@@ -72,31 +66,20 @@ class SpatialPooler:
                  gaussian random distribution.
 
         Argument active_thresh ...
-
-        Argument min_stability ... set to None to disable.
         """
         assert(isinstance(input_sdr, SDR))
+        assert(potential_pool > 1) # Number of synapses, not percent.
         self.mini_columns     = int(round(mini_columns))
         self.macro_columns    = tuple(int(round(dim)) for dim in macro_columns)
+        self.radii            = radii
         self.segments         = int(round(segments))
-        self.min_stability    = min_stability
         self.columns          = SDR(self.macro_columns + (self.mini_columns,),
             activation_frequency_alpha = boosting_alpha,
             average_overlap_alpha      = boosting_alpha,)
         self.sparsity         = sparsity
         self.active_thresh    = active_thresh
-        self.matching_thresh  = matching_thresh
-        self.radii            = radii
         self.potential_pool   = potential_pool
-        assert(potential_pool > 1) # Number of synapses, not percent.
-        self.max_add_synapses = max_add_synapses
-        self.min_add_synapses = min_add_synapses
         self.age              = 0
-
-        init_pp = self.potential_pool
-        if self.min_stability is not None:
-            # If SP is going to be adding synapses then leave room to grow.
-            init_pp = int(init_pp / 2)
 
         segment_shape = self.macro_columns + (self.mini_columns, self.segments)
         self.synapses = SynapseManager(
@@ -107,7 +90,7 @@ class SpatialPooler:
             permanence_inc         = permanence_inc,
             permanence_dec         = permanence_dec,
             permanence_thresh      = permanence_thresh,
-            initial_potential_pool = init_pp,)
+            initial_potential_pool = self.potential_pool,)
 
         if True:
             # Nupic's SP init method
@@ -136,18 +119,14 @@ class SpatialPooler:
             # Initialize to the target activation frequency/sparsity.
             self.boosting.activation_frequency.fill(self.sparsity / self.segments)
 
-        if min_stability is not None:
-            self.prev_columns = SDR(self.columns)
+        self.reset()
 
     def reset(self):
         self.columns.zero()
-        if self.min_stability is not None:
-            self.prev_columns.zero()
+        self.prev_updates = np.full(self.synapses.output_sdr.size, None)
 
     def compute(self, input_sdr=None, input_learning_sdr=None, learn=True):
         """
-        Attribute natural_stability, is always set.  Is the fraction of
-            previously active mini-columns which are winner columns this cycle.
         """
         excitement, potential_excitement = self.synapses.compute(input_sdr=input_sdr)
         excitement = excitement + self.tie_breakers
@@ -157,74 +136,24 @@ class SpatialPooler:
             target_sparsity = self.sparsity / self.segments
             boost = np.log2(self.boosting.activation_frequency) / np.log2(target_sparsity)
             boost = np.nan_to_num(boost)
-            excitement = boost * excitement
+            excitement *= boost
+
+        # Divide excitement by the number of connected synapses.
+        n_con_syns = self.synapses.postsynaptic_connected_count
+        n_con_syns = n_con_syns.reshape(self.synapses.output_sdr.dimensions)
+        percent_overlap = excitement / n_con_syns
 
         # Reduce the segment dimension to each mini-columns single most excited
         # segment.
-        column_excitement = np.max(excitement, axis=-1)
+        column_excitement = np.max(percent_overlap, axis=-1)
+
+        # Stable SP and Grid Cells modify the excitement here.
+        column_excitement = self._compute_hook(column_excitement)
 
         # Activate mini-columns.  First determine how many mini-columns to
         # activate in each macro-column.
         n_activate = max(1, int(round(self.mini_columns * self.sparsity)))
 
-        # Take care of minimum stability columns first so that this keeps a
-        # constant sparsity.
-        if self.min_stability is not None:
-            # Determine the minimum excitement to win in each macro-columns,
-            # assuming that minimum stability is zero (natural stability).
-            k = self.mini_columns - n_activate
-            min_winner = np.argpartition(column_excitement, k, axis=-1)[..., k]
-            min_winner = tuple(np.indices(min_winner.shape)) + (min_winner,)
-            min_winning_excitement = column_excitement[min_winner]
-
-            n_stabilize = int(round(n_activate * self.min_stability))
-
-            stabilized_columns = self._stabilize(
-                self.prev_columns,
-                column_excitement,
-                n_stabilize,)
-
-            # Determine the natural stability for diagnostics.
-            stabilized_excitement = column_excitement[stabilized_columns]
-            excitement_threshold = min_winning_excitement[stabilized_columns[ : -1]]
-            nat_stab = np.count_nonzero(stabilized_excitement >= excitement_threshold)
-            self.natural_stability = nat_stab / (n_activate * np.product(self.macro_columns))
-
-            # Prevent stabilized columns from participating in the competition
-            # and activating second time.
-            column_excitement[stabilized_columns] = self.active_thresh - 1
-            n_activate = max(1, n_activate - n_stabilize)
-
-        winner_columns = self._winners(column_excitement, n_activate)
-
-        # Put the results together and assign them into the output columns sdr.
-        if self.min_stability is not None:
-            self.columns.index = np.concatenate([winner_columns, stabilized_columns], axis=1)
-            # Cycle self.prev_columns in preparation for the next cycle.
-            self.columns.dense  # Make this exist before the assignment tries to copy it.
-            self.prev_columns.assign(self.columns)
-        else:
-            self.columns.index = winner_columns
-
-        if learn:
-            self.synapses.input_sdr.assign(input_learning_sdr)
-
-            self._learn_winners(winner_columns, excitement)
-
-            if self.min_stability is not None:
-                self._learn_stabilized(
-                    stabilized_columns,
-                    potential_excitement,
-                    min_winning_excitement)
-
-            self.age += 1
-
-        return self.columns
-
-    def _winners(self, column_excitement, n_activate):
-        """
-        Returns index tuple of winner columns
-        """
         # Activate the most excited mini-columns in each macro-column.
         k = self.mini_columns - n_activate
         mini_index = np.argpartition(column_excitement, k, axis=-1)[..., k:]
@@ -233,137 +162,35 @@ class SpatialPooler:
         macro_index    = tuple(np.indices(mini_index.shape))[:-1]
         winner_columns = tuple(x.reshape(-1) for x in macro_index + (mini_index,))
         # Filter out columns with sub-threshold excitement.
-        winner_excitement = column_excitement[winner_columns]
+        winner_excitement = np.max(excitement[winner_columns], axis=-1)
         winner_columns    = tuple(np.compress(winner_excitement >= self.active_thresh,
                                       winner_columns, axis=1))
-        return winner_columns
 
-    def _learn_winners(self, columns_index, segment_excitement):
-        """
-        Make the spatial pooler learn about its current inputs and winner columns.
-        """
-        seg_idx = np.argmax(segment_excitement[columns_index], axis=-1)
-        learning_segments = columns_index + (seg_idx,)
-        self.synapses.learn(output_sdr=learning_segments)
+        # Output the results into the columns sdr.
+        self.columns.index = winner_columns
 
-        # Update the exponential moving average of each segments activation frequency.
-        if self.boosting_alpha is not None:
-            self.boosting.assign(learning_segments)
+        if learn:
+            seg_idx = np.argmax(excitement[winner_columns], axis=-1)
+            learning_segments = winner_columns + (seg_idx,)
+            self.prev_updates = self.synapses.learn(
+                input_sdr    = input_learning_sdr,
+                output_sdr   = learning_segments,
+                prev_updates = self.prev_updates,)
 
-    def _stabilize(self,
-        prev_active_columns,
-        column_excitement,
-        n_stabilize):
-        """
-        Activate mini-columns which were active in the previous cycle in order
-        to maintain at least (self.min_stability) percent of mini-column overlap
-        between time steps.
+            # Update the exponential moving average of each segments activation frequency.
+            if self.boosting_alpha is not None:
+                self.boosting.assign(learning_segments)
 
-        Argument prev_active_columns is an SDR
-        Argument column_excitement is array of each mini-column's excitement.
+            self.age += 1
 
-        Returns index tuple of stablizing column activations.
-        """
-        # Search for mini-columns which were previously active in each macro-
-        # column.  Select the currently most excited mini-columns to activate.
-        n_macrocolumns    = np.product(self.macro_columns)
-        eligable_columns  = prev_active_columns.dense.reshape(n_macrocolumns, self.mini_columns)
-        column_excitement = column_excitement.reshape(n_macrocolumns, self.mini_columns)
-        # stabilized_macro_columns and stabilized_mini_columns accumulate mini-
-        # column indices to activate.  The macro columns list contains a
-        # flattened index which is unraveled at the end.
-        stabilized_macro_columns = []
-        stabilized_mini_columns  = []
-        for macro_index in range(n_macrocolumns):
-            # Find the indices of eligable mini-columns in this macro-column.
-            eligable_mini = np.nonzero(eligable_columns[macro_index])[0]
-            n_add_cols    = min(n_stabilize, len(eligable_mini))
-            if n_add_cols == 0:
-                continue
-            # Gather the excitement of eligable mini-columns.
-            eligable_excite = column_excitement[macro_index, eligable_mini]
-            # Find the most excited eligable mini-columns in this macro-column.
-            # selected_nums = np.argpartition(-eligable_excite, n_add_cols-1)[:n_add_cols]
-            k = len(eligable_excite) - n_add_cols
-            selected_nums = np.argpartition(eligable_excite, k)[k :]
-            selected_mini = eligable_mini[selected_nums]
-            stabilized_macro_columns.extend([macro_index] * n_add_cols)
-            stabilized_mini_columns.extend(selected_mini)
-        # Convert the macro-column index to the correct dimensions.
-        stabilized_macro_columns = np.array(stabilized_macro_columns, dtype=np.int)
-        stabilized_macro_columns = np.unravel_index(stabilized_macro_columns, self.macro_columns)
-        stabilized_mini_columns  = np.array(stabilized_mini_columns, dtype=np.int)
-        return stabilized_macro_columns + (stabilized_mini_columns,)
+        return self.columns
 
-    def _learn_stabilized(self,
-        stabilized_columns,
-        potential_excitement,
-        min_winning_excitement):
-        """
-        Make the Spatial Pooler learn about its current inputs and the
-        stabilized mini-columns.  This initializes new segments and adds
-        synapses as needed.
-        """
-        # Prune out dead / zero permanence synapses.
-        if bool(self.max_add_synapses): # Only remove synapses if it can add more later.
-            time_to_zero = self.synapses.permanence_thresh / self.synapses.permanence_dec
-            prune_period = int(10 * time_to_zero)
-            if self.age % prune_period == prune_period - 1:
-                self.synapses.remove_zero_permanence_synapses()
+    def _compute_hook(self, x):
+        """Subclasses override this method."""
+        return x
 
-        # Search for the best matching segment in each stabilized mini-column to
-        # learn.  
-        potential_dense       = potential_excitement[stabilized_columns]
-        best_matching_segment = np.argmax(potential_dense, axis = -1)
-        matching_potential    = potential_dense[np.arange(best_matching_segment.shape[0]), best_matching_segment]
-
-        # Apply a threshold to be rid of weak and insiginificant matches.  The
-        # threshold is a fraction of the excitement which would have been needed
-        # to activate.
-        winning_excitement   = min_winning_excitement[stabilized_columns[ : -1]]
-        winning_excitement   = np.ceil(winning_excitement) # When in doubt, assume the competition is stronger rather than weaker.
-        matching_threshold   = self.matching_thresh * winning_excitement
-        subthreshold_matches = matching_potential < matching_threshold
-
-        # If no good segments exist then start new segments on the least used
-        # segment, by number of potential synapses.
-        needs_new_segment  = tuple(idx[subthreshold_matches] for idx in stabilized_columns)
-        potential_pools    = self.synapses.postsynaptic_sources.reshape(self.synapses.output_sdr.dimensions)
-        potential_pools    = potential_pools[needs_new_segment]
-        array_size         = lambda pp: pp.shape[0]
-        potential_pools_sz = np.frompyfunc(array_size, 1, 1)(potential_pools)
-        new_segments       = np.argmin(potential_pools_sz, axis = -1)
-
-        # Put together the best matching and the newly created segments into an
-        # index of learning segments.
-        best_matching_segment[subthreshold_matches] = new_segments
-        learning_segments = stabilized_columns + (best_matching_segment,)
-
-        # Sort the learning_segments/output_sdr B/C add_synapses requires it.
-        self.synapses.output_sdr.index = learning_segments  # Assign to index, access flat_index, conversion done by SDR class.
-        sort_order = np.argsort(self.synapses.output_sdr.flat_index)
-        self.synapses.output_sdr.flat_index = self.synapses.output_sdr.flat_index[sort_order]
-        # Add synapses to learning segments until they have enough active
-        # presynapses to activate by winning the competition.
-        potential_excitement = potential_excitement[self.synapses.output_sdr.index]
-        potential_excitement.dtype = np.int32   # Otherwise this may add 4 billion new synapses.
-        winning_excitement = winning_excitement[sort_order]
-        winning_excitement = np.maximum(self.min_add_synapses, winning_excitement) # Require at enough synapses to activate.
-        new_synapse_count = (winning_excitement - potential_excitement)
-        new_synapse_count = np.maximum(0, self.max_add_synapses * new_synapse_count)
-        new_synapse_count = np.array(np.rint(new_synapse_count), dtype=np.int)
-        if len(self.synapses.output_sdr) > 0:
-            real_max_add_syn = np.max(new_synapse_count)
-            self.synapses.add_synapses(
-                num_synapses         = new_synapse_count,
-                maximum_new_synapses = real_max_add_syn,
-                maximum_synapses     = self.potential_pool,
-                init_dist            = (0, 0),)
-
-        self.synapses.learn()
-
-    def statistics(self):
-        stats = 'Spatial Pooler '
+    def statistics(self, _class_name='Spatial Pooler'):
+        stats = _class_name + ' '
         stats += self.synapses.statistics()
 
         stats += 'Columns ' + self.columns.statistics()
@@ -379,3 +206,41 @@ class SpatialPooler:
                     boost_mean  * 100,
                     boost_max   * 100,)
         return stats
+
+
+class StableSpatialPooler(SpatialPooler):
+    def __init__(self, stability_rate, **kw_args):
+        SpatialPooler.__init__(self, **kw_args)
+        assert(stability_rate >= 0 and stability_rate <= 1)
+        self.stability_rate = stability_rate
+
+    def reset(self):
+        SpatialPooler.reset(self)
+        self.X_act = np.zeros(self.columns.dimensions)
+
+    def _compute_hook(self, excitement):
+        self.X_act += self.stability_rate * (excitement - self.X_act)
+        return self.X_act
+
+    def statistics(self):
+        return SpatialPooler.statistics(self, _class_name='Stable Spatial Pooler')
+
+
+class GridCells(SpatialPooler):
+    def __init__(self, stability_rate, fatigue_rate, **kw_args):
+        self.stability_rate = stability_rate
+        self.fatigue_rate   = fatigue_rate
+        SpatialPooler.__init__(self, **kw_args)
+
+    def reset(self):
+        self.X_act   = np.zeros(self.columns.dimensions)
+        self.X_inact = np.zeros(self.columns.dimensions)
+        SpatialPooler.reset(self)
+
+    def _compute_hook(self, excitement):
+        self.X_act   += self.stability_rate * (excitement - self.X_act - self.X_inact)
+        self.X_inact += self.fatigue_rate   * (excitement - self.X_inact)
+        return self.X_act
+
+    def statistics(self):
+        return SpatialPooler.statistics(self, _class_name='Grid Cells')
