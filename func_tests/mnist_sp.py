@@ -1,21 +1,30 @@
 #!/usr/bin/python3
-# Written by David McDougall, 2018
+"""
+Written by David McDougall, 2018
+
+Functional Test: MNIST-SP
+
+This tests that the spatial pooler can recognise basic patterns in its input.
+The system consists of a simple black & white image encoder, a spatial pool, and
+an SDR classifier.  The task is to recognise images of hand written numbers 0-9.
+This should score at least 95%.
+"""
 
 import argparse
 import random
-import sys
-sys.path.append('.')
-from spatial_pooler import SpatialPooler
-from sdr import SDR
-from nupic.algorithms.sdr_classifier import SDRClassifier
+import gzip
 import scipy.ndimage
 import numpy as np
 
+import sys
+sys.path.append('.')
+from sdr import SDR
+from spatial_pooler import SpatialPooler
+from nupic.algorithms.sdr_classifier import SDRClassifier
+from synapses import debug as synapses_debug
+
 def load_mnist():
     """See: http://yann.lecun.com/exdb/mnist/ for MNIST download and binary file format spec."""
-    import gzip
-    import numpy as np
-
     def int32(b):
         i = 0
         for char in b:
@@ -136,12 +145,24 @@ class BWImageEncoder:
         self.output.dense = np.dstack([on_bits, off_bits])
         return self.output
 
+default_parameters = {
+ 'active_thresh': 28,
+ 'boosting_alpha': 0.0007133352820011685,
+ 'macro_columns': (15, 10),
+ 'mini_columns': 250,
+ 'permanence_dec': 0.009282175512186927,
+ 'permanence_inc': 0.032294958166728734,
+ 'permanence_thresh': 0.4222038828631455,
+ 'potential_pool': 106,
+ 'radii': (2.7582610908140706, 2.9070918151296423),
+ 'sparsity': 0.014091711495013154}
 
-if __name__ == '__main__':
+def main(parameters=default_parameters, argv=None, verbose=True):
     parser = argparse.ArgumentParser()
     parser.add_argument('-t', '--time', type=float, default=1,
                         help='Number of times to run through the training data.')
-    args = parser.parse_args()
+    parser.add_argument('--debug', action='store_true')
+    args = parser.parse_args(args = argv)
 
     # Load data.
     train_labels, train_images, test_labels, test_images = load_mnist()
@@ -157,73 +178,63 @@ if __name__ == '__main__':
 
     training_data = list(zip(train_images, train_labels))
     test_data     = list(zip(test_images, test_labels))
+    random.shuffle(training_data)
+    random.shuffle(test_data)
+    if args.debug and args.time < 1:
+        test_data = test_data[: int(len(test_data) * args.time)]
     # Setup spatial pooler machine.
     enc = BWImageEncoder(train_images[0].shape[:2])
     sp = SpatialPooler(
-        active_thresh     = 24,
-        boosting_alpha    = 0.000701925973755,
-        init_dist         = (0.4, 0.1),
-        mini_columns      = 200,
-        permanence_dec    = 0.0132731225331,
-        permanence_inc    = 0.031055329686,
-        permanence_thresh = 0.45,
-        potential_pool    = 150,
-        segments          = 1,
-        sparsity          = 0.01,
         input_sdr         = enc.output,
-        radii             = (3.21, 2.13),
-        macro_columns     = (10, 10))
+        segments          = 1,
+        **parameters)
     sdrc = SDRClassifier(steps=[0])
 
-    print(sp.statistics())
+    if verbose:
+        print(sp.statistics())
 
     # Training Loop
     train_cycles = len(train_images) * args.time
-    print("Training for %d cycles"%train_cycles)
+    if verbose:
+        print("Training for %d cycles"%train_cycles)
     for i in range(int(round(train_cycles))):
+        sp.reset()
         img, lbl      = random.choice(training_data)
         img           = synthesize(img, diag=False)
         enc.encode(np.squeeze(img))
         sp.compute()
-        sp.learn()
         sdrc.compute(i, sp.columns.flat_index,
             classification={"bucketIdx": lbl, "actValue": lbl},
             learn=True, infer=False)
 
-    print("Removing zero permanence synapses.")
-    sp.synapses.remove_zero_permanence_synapses()
-    print(sp.statistics())
+    if verbose:
+        print("Done training.")
+        print("")
+        print("Removing zero permanence synapses.")
+        sp.synapses.remove_zero_permanence_synapses()
+        print(sp.statistics())
 
     # Testing Loop
+    if verbose:
+        print("Testing for %d cycles."%len(test_data))
     score = 0
     for img, lbl in test_data:
         enc.encode(np.squeeze(img))
-        sp.compute()
-        inference = sdrc.infer(sp.columns.flat_index, None)
-        if lbl == np.argmax(inference[0]):
+        sp.compute(learn=False)
+        try:
+            inference = sdrc.infer(sp.columns.flat_index, None)[0]
+        except IndexError:
+            inference = np.zeros(10)
+        if lbl == np.argmax(inference):
             score += 1
 
     print('Score:', 100 * score / len(test_data), '%')
-    sp.synapses.check_data_integrity()
-    print("Synapse data structure integrity is OK.")
 
+    if synapses_debug:
+        sp.synapses.check_data_integrity()
+        print("Synapse data structure integrity is OK.")
 
-if False:
-    # I'm keeping the following diagnostic code snippets just in case I ever
-    # need them.  They are outdated and do not work.
-    from matplotlib import pyplot as plt
+    return score / len(test_data)
 
-    if False:
-        # Experiment to test what happens when areas are not given meaningful
-        # input.  Adds 2 pixel black border around image.  Also manually
-        # disabled translation in the synthesize funtion.
-        def expand_images(mnist_images):
-            new_images = []
-            for img in mnist_images:
-                assert(img.shape == (28, 28, 1))
-                new_img = np.zeros((32, 32, 1))
-                new_img[2:-2, 2:-2, :] = img
-                new_images.append(new_img)
-            return new_images
-        train_images = expand_images(train_images)
-        test_images  = expand_images(test_images)
+if __name__ == '__main__':
+    main()

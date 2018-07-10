@@ -1,8 +1,18 @@
 #!/usr/bin/python3
-"""Written by David McDougall, 2018"""
+"""
+Functional Test: STABILITY
+Written by David McDougall, 2018
 
-# TODO: Add CLI arguments for variables: num_objects, object_sizes,
-# steps_per_object, dataset_iterations, and test_iterations.
+This verifies basic properties of the Stable Spatial Pooler.  This generates a
+new artificial dataset every time.  The dataset consists of randomly generated
+SDRs which are fed into the system as a timeseries.  The dataset represents
+objects. Objects are composed of non-mutually-exclusive sets of inputs.  Each
+computation cycle the system sees part of an object, and the system sees
+multiple parts of an object on consequtive cycles.  The test is to form a single
+stable representation of each object, despite each object being composed of
+disimilar components.  The second test is to recognise each object as it is
+seen.
+"""
 
 import numpy as np
 import itertools
@@ -13,7 +23,7 @@ import sys
 sys.path.append('.')
 from sdr import SDR
 from encoders import EnumEncoder
-from stable_spatial_pooler import SpatialPooler
+from spatial_pooler import StableSpatialPooler
 from nupic.algorithms.sdr_classifier import SDRClassifier
 from synapses import debug as synapses_debug
 
@@ -59,7 +69,7 @@ def measure_inter_intra_overlap(catagories, verbose = True):
         print("Warning: stability_samples == 0")
     stability = stability / stability_samples
     if verbose:
-        print('Intra Category Overlap', stability, '(%d samples)'%stability_samples)
+        print('Intra Category Overlap %g%% (%d samples)'%(100*stability, stability_samples))
 
     # Measure average overlap between categories.
     distinctiveness         = 0
@@ -81,27 +91,27 @@ def measure_inter_intra_overlap(catagories, verbose = True):
     except ZeroDivisionError:
         stability_metric = float('nan')
     if verbose:
-        print('Inter Category Overlap', distinctiveness, '(%d samples)'%distinctiveness_samples)
+        print('Inter Category Overlap %g%% (%d samples)'%(100*distinctiveness, distinctiveness_samples))
         print('Stability Metric',       stability_metric)
     return stability, distinctiveness, stability_metric
 
 default_parameters = {
-          'active_thresh': 2,
-          'boosting_alpha': 0.005314384991721661,
-          'mini_columns': 2250,
-          'permanence_dec': 0.003675899084079108,
-          'permanence_inc': 0.06150975770904488,
-          'permanence_thresh': 0.10528865328008735,
-          'potential_pool': 1944,
+          'active_thresh': 10,
+          'boosting_alpha': 0.005694742035947877,
+          'mini_columns': 2112,
+          'permanence_dec': 0.0034674259121478907,
+          'permanence_inc': 0.06557477182718344,
+          'permanence_thresh': 0.11140401898422288,
+          'potential_pool': 2010,
           'segments': 6,
-          'sparsity': 0.02510590443564408,
-          'stability_rate': 0.06362902461378779}
+          'sparsity': 0.026277223129229404,
+          'stability_rate': 0.06921208621873447}
 
-def main(parameters=default_parameters, argv=None, debug=True):
+def main(parameters=default_parameters, argv=None, verbose=True):
     # Setup
     num_objects        = 100
     object_sizes       = range(20, 40+1)
-    dataset_iterations = 100    # Used for training.
+    train_iterations   = 100
     test_iterations    = 5
     steps_per_object   = range(3, 17+1)
     inputs, objects = object_dataset(num_objects, object_sizes)
@@ -111,7 +121,7 @@ def main(parameters=default_parameters, argv=None, debug=True):
         activation_frequency_alpha = parameters['boosting_alpha'],
         average_overlap_alpha      = parameters['boosting_alpha'],)
 
-    sp = SpatialPooler(
+    sp = StableSpatialPooler(
         input_sdr         = enc.output_sdr,
         macro_columns     = (1,),
         **parameters)
@@ -130,24 +140,24 @@ def main(parameters=default_parameters, argv=None, debug=True):
         sp.reset()
         return objects_columns
 
-    if debug:
+    if verbose:
         print("Num-Inputs  ", len(set(itertools.chain.from_iterable(objects))))
         print('Num-Objects ', num_objects)
         print("Object-Sizes", object_sizes)
         print("Steps/Object", steps_per_object)
         print(sp.statistics())
         objects_columns = measure_catagories()
-        measure_inter_intra_overlap(objects_columns, debug)
+        measure_inter_intra_overlap(objects_columns, verbose)
         print("")
 
         # TRAIN
-        train_time = dataset_iterations * num_objects * np.mean(steps_per_object)
-        print('TRAINING for ~%d Cycles (%d dataset iterations) ...'%(train_time, dataset_iterations))
+        train_time = train_iterations * num_objects * np.mean(steps_per_object)
+        print('TRAINING for ~%d Cycles (%d dataset iterations) ...'%(train_time, train_iterations))
         print("")
 
     sp.reset()
     t = 0
-    for iteration in range(dataset_iterations):
+    for iteration in range(train_iterations):
         object_order = list(range(num_objects))
         random.shuffle(object_order)
         for object_id in object_order:
@@ -155,27 +165,30 @@ def main(parameters=default_parameters, argv=None, debug=True):
                 sensation = random.choice(objects[object_id])
                 enc.encode(sensation)
                 sp.compute()
-                sdrc.compute(t, sp.columns.flat_index,
-                    classification = {"bucketIdx": object_id, "actValue": object_id,},
-                    learn=True, infer=False)
+                try:
+                    sdrc.compute(t, sp.columns.flat_index,
+                        classification = {"bucketIdx": object_id, "actValue": object_id,},
+                        learn=True, infer=False)
+                except ValueError:
+                    print("Warning: len(active) = %d."%(len(sp.columns)))
                 t += 1
 
-    if debug:
+    if verbose:
         print("TESTING ...")
         print("")
         print('Encoder Output', enc.output_sdr.statistics())
         print(sp.statistics())
 
     objects_columns = measure_catagories()
-    _, __, stability_metric = measure_inter_intra_overlap(objects_columns, debug)
+    _, __, stability_metric = measure_inter_intra_overlap(objects_columns, verbose)
 
     # Measure classification accuracy.  This test consists of looking at every
-    # object three times and then classifying it.  The AI is evaluated on every
+    # object a few times and then classifying it.  The AI is evaluated on every
     # cycle.
     score = 0
     max_score = 0
     sp.reset()
-    if debug:
+    if verbose:
         print("")
         print("Test length: %d dataset iterations."%(test_iterations))
     test_data = list(range(num_objects))
@@ -191,14 +204,14 @@ def main(parameters=default_parameters, argv=None, debug=True):
                 if inference == object_id:
                     score += 1
                 max_score += 1
-    if debug:
+    if verbose:
         print('Classification Accuracy: %g %%'%(100 * score / max_score))
 
     if synapses_debug:
         sp.synapses.check_data_integrity()
         print("Synapse data structure integrity is OK.")
 
-    return stability_metric + (score / max_score)
+    return stability_metric + 10 * (score / max_score)
 
 if __name__ == '__main__':
     main()
