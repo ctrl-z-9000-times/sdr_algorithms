@@ -92,7 +92,9 @@ def measure_inter_intra_overlap(catagories, verbose = True):
         stability_metric = float('nan')
     if verbose:
         print('Inter Category Overlap %g%% (%d samples)'%(100*distinctiveness, distinctiveness_samples))
-        print('Stability Metric',       stability_metric)
+        samples_per_cat = np.mean([len(cat) for cat in catagories])
+        print("Num Catagories %d, Avg Samples per Catagory %g"%(len(catagories), samples_per_cat))
+        print('Stability Metric %g'%stability_metric)
     return stability, distinctiveness, stability_metric
 
 default_parameters = {

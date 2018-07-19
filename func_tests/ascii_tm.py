@@ -31,6 +31,8 @@ def read_dictionary():
     # Reject apostrophies from the dictionary.  Words with apostrophies are
     # mostly duplicates and this makes the printouts look nicer.
     dictionary = [word for word in dictionary if "'" not in word]
+    # Convert to all capital letters.
+    dictionary = [word.upper() for word in dictionary]
     return dictionary
 
 state_names = [
@@ -87,29 +89,31 @@ state_names = [
 ]
 
 default_parameters = {
-          'enc': {'size': 5102, 'sparsity': 0.017973130662032412},
-          'sp': {'mini_columns': 1225,
-                 'permanence_dec': 0.0028900881528214164,
-                 'permanence_inc': 0.021027522837449332,
-                 'permanence_thresh': 0.024721604498563178,
-                 'potential_pool': 3298,
-                 'sparsity': 0.03775592629273584},
-          'tm': {'add_synapses': 31,
-                 'cells_per_column': 19,
-                 'init_dist': (0.7167876106409492, 0.0),
-                 'learning_threshold': 9,
-                 'mispredict_dec': 0.0023680534135813087,
-                 'permanence_dec': 0.005098356000496391,
-                 'permanence_inc': 0.04597764517227905,
-                 'permanence_thresh': 0.23155288819735864,
-                 'predicted_boost': 3,
-                 'predictive_threshold': 24,
-                 'segments_per_cell': 26,
-                 'synapses_per_segment': 37}}
+    'enc': {'size': 3896, 'sparsity': 0.011016943726056617},
+      'sp': {'mini_columns': 2000,    # MODIFIED
+             'permanence_dec': 0.0030453258771592872,
+             'permanence_inc': 0.01735636057973911,
+             'permanence_thresh': 0.039191950857707235,
+             'potential_pool': 2613,
+             'sparsity': 0.06306098753882936,
+            'boosting_alpha' : 1./100,},    # MODIFIED
+      'tm': {'add_synapses': 23,
+             'cells_per_column': 32,    # MODIFIED
+             'init_dist': (0.5416786696673432, 0.010625659253282042),
+             'learning_threshold': 9,
+             'mispredict_dec': 0.002446443463633688,
+             'permanence_dec': 0.006316828613210894,
+             'permanence_inc': 0.08130270896950871,
+             'permanence_thresh': 0.3287960867800625,
+             'predicted_boost': 2,
+             'predictive_threshold': 27,
+             'segments_per_cell': 10, # 26,    # MODIFIED
+             'synapses_per_segment': 60},    # MODIFIED
+      'tm_sdrc': {'alpha': 0.0009815495088055376}}
 
 def main(parameters=default_parameters, argv=None, verbose=True):
     parser = argparse.ArgumentParser()
-    parser.add_argument('-t', '--time', type=int, default=20,
+    parser.add_argument('-t', '--time', type=int, default=5,
                         help='Number of times to run through the training data.')
     parser.add_argument('--dataset', choices=('states', 'dictionary'), default='states')
     args = parser.parse_args(args = argv)
@@ -117,14 +121,14 @@ def main(parameters=default_parameters, argv=None, verbose=True):
     # Load data.
     if args.dataset == 'states':
         dataset = state_names
-        print("Dataset is %d state names"%len(dataset))
+        if verbose:
+            print("Dataset is %d state names"%len(dataset))
     elif args.dataset == 'dictionary':
         dataset = read_dictionary()
-        dataset = random.sample(dataset, 200)
+        dataset = random.sample(dataset, 500)
         if verbose:
             print("Dataset is dictionary words, sample size %d"%len(dataset))
 
-    dataset   = [word.upper() for word in dataset]
     dataset   = sorted(dataset)
     word_ids  = {word: idx for idx, word in enumerate(sorted(dataset))}
     confusion = np.zeros((len(dataset), len(dataset)))
@@ -132,17 +136,20 @@ def main(parameters=default_parameters, argv=None, verbose=True):
         print("Dataset: " + ", ".join('%d) %s'%idx_word for idx_word in enumerate(dataset)))
 
     # Construct TM.
+    diagnostics_alpha = parameters['sp']['boosting_alpha']
     enc = EnumEncoder(**parameters['enc'])
-    enc.output_sdr = SDR(enc.output_sdr, average_overlap_alpha = 1./1000)
+    enc.output_sdr = SDR(enc.output_sdr, average_overlap_alpha = diagnostics_alpha)
     sp = SpatialPooler(
         input_sdr         = enc.output_sdr,
-        boosting_alpha    = 1./1000,
         **parameters['sp'])
     tm = TemporalMemory(
         column_sdr        = sp.columns,
-        anomaly_alpha     = 1/1000,
+        anomaly_alpha     = diagnostics_alpha,
         **parameters['tm'])
-    sdrc = SDRClassifier(steps=[0])
+    sdrc = SDRClassifier(steps=[0], **parameters['tm_sdrc'])
+    sdrc.compute(-1, [tm.active.size-1],    # Initialize the table.
+        classification={"bucketIdx": [len(dataset)-1], "actValue": [len(dataset)-1]},
+        learn=True, infer=False)
 
     def reset():
         enc.output_sdr.zero()
@@ -151,8 +158,8 @@ def main(parameters=default_parameters, argv=None, verbose=True):
 
     # Train.
     if verbose:
-        print("Training for %d cycles"%(args.time * sum(len(w) for w in dataset)))
-    t = 0
+        train_cycles = args.time * sum(len(w) for w in dataset)
+        print("Training for %d cycles (%d dataset iterations)"%(train_cycles, args.time))
     for i in range(args.time):
         random.shuffle(dataset)
         for word in dataset:
@@ -162,10 +169,9 @@ def main(parameters=default_parameters, argv=None, verbose=True):
                 sp.compute()
                 tm.compute()
             lbl = word_ids[word]
-            sdrc.compute(t, tm.active.flat_index,
+            sdrc.compute(tm.age, tm.learning.flat_index,
                 classification={"bucketIdx": lbl, "actValue": lbl},
                 learn=True, infer=False)
-            t += 1
 
     if verbose:
         print("Encoder", enc.output_sdr.statistics())
