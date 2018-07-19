@@ -20,14 +20,8 @@ Usage:
 $ swarming.py [swarming arguments] ExperimentModule.py [experiment arguments]
 """
 
-# TODO: Add CLI argument for a process time limit?
-# TODO: Add CLI argument for a process memory limit?
-
 # TODO: Deal with global constants: particle_strength, global_strength, velocity_strength
 #       Maybe make them into CLI Arguments?
-
-# TODO: When an evaluation raises a ValueError or MemoryError replace the
-# particles current value, velocity, and continue.
 
 import argparse
 import sys
@@ -37,10 +31,12 @@ import pprint
 import time
 import multiprocessing
 import resource
+import signal
 
-particle_strength   = .1
-global_strength     = .1
-velocity_strength   = .9
+particle_strength   = .25
+global_strength     = .50
+velocity_strength   = .90
+assert(velocity_strength + particle_strength / 2 + global_strength / 2 >= 1)
 
 def parameter_types(default_parameters):
     """
@@ -165,6 +161,11 @@ if __name__ == '__main__':
     arg_parser.add_argument('-n', '--processes',  type=int, default=os.cpu_count(),)
     arg_parser.add_argument('-p', '--particles',  type=int, default=10,
         help='Size of swarm, number of particles to use.')
+    arg_parser.add_argument('--time_limit',  type=float, default=None,
+        help='Hours, time limit for parameter score evaluations.',)
+    arg_parser.add_argument('--memory_limit',  type=float, default=None,
+        help=('Gigabytes, RAM memory limit for parameter score evaluations.'
+            'Default is (12 - 1.5) / N'),)
     arg_parser.add_argument('--clear_scores', action='store_true',
         help=('Remove all scores from the particle swarm so that the '
               'experiment can be safely altered.'))
@@ -172,8 +173,11 @@ if __name__ == '__main__':
         help='Name of experiment module followed by its command line arguments.')
     args = arg_parser.parse_args()
     assert(args.particles >= args.processes)
-    memory_limit = int((12e9 - 1.5e9) / args.processes)
-    print("Memory Limit %g GB per instance."%(memory_limit / 1e9))
+    if args.memory_limit is not None:
+        memory_limit = args.memory_limit * 1e9
+    else:
+        memory_limit = int((12e9 - 1.5e9) / args.processes)
+        print("Memory Limit %g GB per instance."%(memory_limit / 1e9))
 
     # Load the experiment module.
     experiment_file = args.experiment[0]
@@ -191,15 +195,28 @@ if __name__ == '__main__':
         1/0
         return parameters, score
 
+    def timeout_callback(signum, frame):
+        raise ValueError("Time limit exceded.")
+
     def evaluate_particle(particle_data):
+        # Setup time limits
+        if args.time_limit is not None:
+            signal.signal(signal.SIGALRM, timeout_callback)
+            time_limit = max(1, int(round(args.time_limit * 60 * 60)))
+            signal.alarm(time_limit)
+        # Setup memory limits
         _, hard = resource.getrlimit(resource.RLIMIT_AS)
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit, hard))
+
         parameters = typecast_parameters(particle_data['value'], parameter_structure)
         eval_str = ('%s.main(parameters=%s, argv=[%s], verbose=False)'%(
                     experiment_module,
                     repr(parameters),
                     ', '.join("'%s'"%arg for arg in args.experiment[1:]),))
-        return eval(eval_str)
+        score = eval(eval_str)
+        if args.time_limit is not None:
+            signal.alarm(0) # Disable time limit.
+        return score
 
     # Setup the particle swarm.
     swarm_path = os.path.join(experiment_path, experiment_module) + '.pso'
@@ -295,18 +312,20 @@ if __name__ == '__main__':
                 particle_data = swarm_data[particle_number]
                 try:
                     score = promise.get()
-                except (ValueError, MemoryError) as err:
+                except (ValueError, MemoryError, ZeroDivisionError,) as err:
                     print("")
                     print("Particle Number %d"%particle_number)
                     pprint.pprint(particle_data['value'])
                     print("%s:"%(type(err).__name__), err)
                     print("")
-                    # TODO: Consider replacing this particle with (in order of
-                    # preference, but tolerating Nones):
-                    #   1) particle best,
-                    #   2) global best,
-                    #   3) new particle from defaults.
-                    # In all cases give new random velocity.
+                    # Replace this particle.
+                    particle_data['velocity'] = initial_velocity(default_parameters)
+                    if particle_data['best_score'] is not None:
+                        particle_data['value'] = particle_data['best']
+                    elif swarm_data['best_score'] is not None:
+                        particle_data['value'] = swarm_data['best']
+                    else:
+                        particle_data['value'] = initial_parameters(default_parameters)
                     continue
                 except Exception:
                     print("")
@@ -321,6 +340,7 @@ if __name__ == '__main__':
                 if swarm_data['best_score'] is None or score > swarm_data['best_score']:
                     swarm_data['best']       = typecast_parameters(particle_data['best'], parameter_structure)
                     swarm_data['best_score'] = particle_data['best_score']
+                    swarm_data['best_particle'] = particle_number
                     print("New global best score %g"%swarm_data['best_score'])
 
                 # Save the swarm to file.

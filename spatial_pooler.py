@@ -192,10 +192,11 @@ class SpatialPooler:
     def statistics(self, _class_name='Spatial Pooler'):
         stats = _class_name + ' '
         stats += self.synapses.statistics()
-
         stats += 'Columns ' + self.columns.statistics()
-        if self.boosting_alpha is not None and self.segments > 1:
-            stats      += 'Segments ' + self.boosting.statistics()
+
+        if self.boosting_alpha is not None:
+            if self.segments > 1:
+                stats  += 'Segments ' + self.boosting.statistics()
             af         = self.boosting.activation_frequency
             target     = self.sparsity / self.segments
             boost_min  = np.log2(np.min(af))  / np.log2(target)

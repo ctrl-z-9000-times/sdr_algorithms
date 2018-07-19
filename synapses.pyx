@@ -376,17 +376,38 @@ class SynapseManager:
             PERMANENCE_t inc, dec, thresh = self.permanence_thresh
             bint syn_prior, syn_post
 
-            # Correlate input learning stuff.
-            np.ndarray[object] _prev_updates   = prev_updates
-            np.ndarray[object] current_updates = np.full(self.output_sdr.size, None)
-            np.ndarray[PERMANENCE_t] prev_update_row = None
-            np.ndarray[PERMANENCE_t] current_update_row
-
         # Arguments override initialized or default values.
         inc = permanence_inc if permanence_inc is not None else self.permanence_inc
         dec = permanence_dec if permanence_dec is not None else self.permanence_dec
         if inc == 0. and dec == 0.:
             return
+
+        # Correlate input learning stuff.
+        cdef:
+            np.ndarray[object] _prev_updates
+            np.ndarray[object] current_updates = np.full(self.output_sdr.size, None)
+            np.ndarray[PERMANENCE_t] prev_update_row
+            np.ndarray[PERMANENCE_t] current_update_row
+            np.ndarray[object]       prev_updates_merged, update_table
+            np.ndarray[PERMANENCE_t] update_row
+        if isinstance(prev_updates, tuple):
+            # If given a tuple then each element is a complete updates table.
+            # Add the update tables, None's are implicit rows of zeros.
+            prev_updates_merged = np.full(self.output_sdr.size, None)
+            for update_table in prev_updates:
+                for out_idx1 in range(self.output_sdr.size):
+                    update_row = update_table[out_idx1]
+                    if update_row is not None:
+                        prev_update_row = prev_updates_merged[out_idx1]
+                        if prev_update_row is not None:
+                            prev_updates_merged[out_idx1] = (update_row + prev_update_row)
+                        else:
+                            prev_updates_merged[out_idx1] = update_row
+            _prev_updates = prev_updates_merged
+        elif prev_updates is not None:
+            _prev_updates = prev_updates
+        else:
+            _prev_updates = current_updates # This is a hack...
 
         for out_iter in range(output_activity.shape[0]):
             out_idx1 = output_activity[out_iter]
@@ -396,10 +417,17 @@ class SynapseManager:
             perms_inner      = <np.ndarray[PERMANENCE_t]> permanences[out_idx1]
             out_size         = sources_sizes[out_idx1]
 
-            if _prev_updates is not None:
-                prev_update_row = _prev_updates[out_idx1]
-                current_update_row = np.zeros(out_size, dtype=PERMANENCE)
-                current_updates[out_idx1] = current_update_row
+            current_update_row = <np.ndarray[PERMANENCE_t]> np.zeros(out_size, dtype=PERMANENCE)
+            current_updates[out_idx1] = current_update_row  # Possible reference to _prev_updates
+            prev_update_row    = <np.ndarray[PERMANENCE_t]> _prev_updates[out_idx1]
+            if prev_update_row is None:
+                prev_update_row = <np.ndarray[PERMANENCE_t]> np.zeros(out_size, dtype=PERMANENCE)
+            elif prev_update_row.shape[0] < out_size:
+                # Synapses were added since updates were computed, assign zeros
+                # to the new synapses previous updates.
+                update_row = <np.ndarray[PERMANENCE_t]> np.zeros(out_size, dtype=PERMANENCE)
+                update_row[ : prev_update_row.shape[0]] = prev_update_row
+                prev_update_row = update_row
 
             for out_idx2 in range(out_size):
                 inp_idx1     = sources_inner[out_idx2]
@@ -411,22 +439,20 @@ class SynapseManager:
                     perm_delta = inc
                 else:
                     perm_delta = -dec
+                # Update with hebbian learning and subtract away the previous learning update.
+                # perm_value += perm_delta - prev_update_row[out_idx2]
+                if perm_delta != prev_update_row[out_idx2]:
+                    perm_value += perm_delta
 
-                if prev_update_row is not None:
-                    # Update the current learning updates.
-                    current_update_row[out_idx2] = perm_delta
-                    # Subtract away the previous learning updates 
-                    perm_delta -= prev_update_row[out_idx2]
-
-                perm_value += perm_delta
                 # Clip permanence to [0, 1]
                 if perm_value > 1.:
                     perm_value = 1.
                 elif perm_value < 0.:
                     perm_value = 0.
-
-                syn_post      = perm_value >= thresh
+                syn_post = perm_value >= thresh
                 perms_inner[out_idx2] = perm_value
+
+                current_update_row[out_idx2] = perm_delta
 
                 if presyn_perms is not None:
                     inp_idx2     = sources2_inner[out_idx2]

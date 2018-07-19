@@ -84,6 +84,7 @@ class TemporalMemory:
     def reset(self):
         self.active.zero()
         self.learning.zero()
+        self.prev_updates = np.full(self.synapses.output_sdr.size, None)
 
     def compute(self,
         column_sdr=None,
@@ -158,9 +159,10 @@ class TemporalMemory:
         else:
             self.synapses.input_sdr.assign(self.learning)
 
-        self._learn_predicted(predicted_active)
-        bursting_learning = self._learn_bursting(bursting_columns)
-        self._learn_mispredicted(columns)
+        predicted_updates = self._learn_predicted(predicted_active)
+        bursting_learning, burst_updates = self._learn_bursting(bursting_columns)
+        mispredicted_updates = self._learn_mispredicted(columns)
+        self.prev_updates = (predicted_updates, burst_updates, mispredicted_updates,)
 
         self.learning.index = tuple(np.concatenate([predicted_active, bursting_learning], axis=1))
 
@@ -169,10 +171,9 @@ class TemporalMemory:
         time_to_zero = mean_initial_permanence / self.synapses.permanence_dec
         remove_zero_perm_syns_period = int(100 * time_to_zero)
         if self.age % remove_zero_perm_syns_period == remove_zero_perm_syns_period-1:
-            # import time
-            # start_time = time.time()
             self.synapses.remove_zero_permanence_synapses()
-            # print("Removed zero permanence synapses, time:", time.time() - start_time, 'seconds')
+            # Dropping the updates won't hurt too much.
+            self.prev_updates = np.full(self.synapses.output_sdr.size, None)
 
         self.age += 1
 
@@ -183,7 +184,9 @@ class TemporalMemory:
         col_idx  = predicted_active[0][cell_num]
         cell_idx = predicted_active[1][cell_num]
         segments = (col_idx, cell_idx, seg_idx)
-        self.synapses.learn(output_sdr = segments)
+        updates  = self.synapses.learn(
+            output_sdr = segments,
+            prev_updates   = self.prev_updates,)
 
         # Add synapses to active segments until they have self.add_synapses many
         # active presynapses.
@@ -196,6 +199,7 @@ class TemporalMemory:
             maximum_synapses     = self.synapses_per_segment,
             maximum_new_synapses = self.add_synapses,
             evict                = True,)
+        return updates
 
     def _learn_bursting(self, bursting_columns):
         # Select a single segment to learn in every bursting column.
@@ -242,7 +246,9 @@ class TemporalMemory:
             burst_learning = tuple(np.array(matching_segments, dtype=np.int))
 
         # Apply the Hebbian learning rules.
-        self.synapses.learn(output_sdr = burst_learning,)
+        updates = self.synapses.learn(
+            output_sdr   = burst_learning,
+            prev_updates = self.prev_updates,)
 
         # Create additional synapses.  Add synapses to the segments until they
         # have self.add_synapses many active presynapses.
@@ -258,7 +264,7 @@ class TemporalMemory:
 
         # Return a list of neurons which are learning.  Strip off the segments
         # dimension.
-        return burst_learning[0:2]
+        return burst_learning[0:2], updates
 
     def _learn_mispredicted(self, active_columns):
         """
@@ -270,9 +276,12 @@ class TemporalMemory:
         mispredictions = np.array(self.matching_segments, copy=True)
         mispredictions[active_columns] = 0
         mispredictions.dtype = np.uint8
-        self.synapses.learn(output_sdr     = mispredictions,
-                            permanence_inc = -self.mispredict_dec,
-                            permanence_dec = 0,)
+        updates = self.synapses.learn(
+            output_sdr     = mispredictions,
+            permanence_inc = -self.mispredict_dec,
+            permanence_dec = 0,
+            prev_updates   = self.prev_updates,)
+        return updates
 
     def statistics(self):
         stats  = 'Temporal Memory\n'
