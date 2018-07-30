@@ -23,6 +23,11 @@ $ swarming.py [swarming arguments] ExperimentModule.py [experiment arguments]
 # TODO: Deal with global constants: particle_strength, global_strength, velocity_strength
 #       Maybe make them into CLI Arguments?
 
+particle_strength   =  .25
+global_strength     =  .50
+velocity_strength   =  .95
+assert(velocity_strength + particle_strength / 2 + global_strength / 2 >= 1)
+
 import argparse
 import sys
 import os
@@ -32,11 +37,6 @@ import time
 import multiprocessing
 import resource
 import signal
-
-particle_strength   = .25
-global_strength     = .50
-velocity_strength   = .90
-assert(velocity_strength + particle_strength / 2 + global_strength / 2 >= 1)
 
 def parameter_types(default_parameters):
     """
@@ -109,7 +109,13 @@ def initial_velocity(default_parameters):
 def initialize_particle_swarm(default_parameters, num_particles):
     swarm_data = {}
     for particle in range(num_particles):
-        value = initial_parameters(default_parameters)
+        if particle in [0, 1, 2]:
+            # Evaluate the default parameters a few times, before branching out
+            # to the mre experimential stuff.  Several evals are needed since
+            # these defaults will have their random velocity applied.
+            value = default_parameters
+        else:
+            value = initial_parameters(default_parameters)
         swarm_data[particle] = {
             'value':      value,
             'velocity':   initial_velocity(default_parameters),
@@ -165,7 +171,7 @@ if __name__ == '__main__':
         help='Hours, time limit for parameter score evaluations.',)
     arg_parser.add_argument('--memory_limit',  type=float, default=None,
         help=('Gigabytes, RAM memory limit for parameter score evaluations.'
-            'Default is (12 - 1.5) / N'),)
+            'Default is (20 - 1.5   ) / N'),)
     arg_parser.add_argument('--clear_scores', action='store_true',
         help=('Remove all scores from the particle swarm so that the '
               'experiment can be safely altered.'))
@@ -176,7 +182,7 @@ if __name__ == '__main__':
     if args.memory_limit is not None:
         memory_limit = args.memory_limit * 1e9
     else:
-        memory_limit = int((12e9 - 1.5e9) / args.processes)
+        memory_limit = int((20e9 - 1.5e9) / args.processes)
         print("Memory Limit %g GB per instance."%(memory_limit / 1e9))
 
     # Load the experiment module.
@@ -312,7 +318,7 @@ if __name__ == '__main__':
                 particle_data = swarm_data[particle_number]
                 try:
                     score = promise.get()
-                except (ValueError, MemoryError, ZeroDivisionError,) as err:
+                except (ValueError, MemoryError, ZeroDivisionError, AssertionError) as err:
                     print("")
                     print("Particle Number %d"%particle_number)
                     pprint.pprint(particle_data['value'])
@@ -346,6 +352,7 @@ if __name__ == '__main__':
                 # Save the swarm to file.
                 swarm_data['evals'] += 1
                 with open(swarm_path, 'w') as swarm_file:
+                    print('# ' + ' '.join(sys.argv), file=swarm_file)
                     pprint.pprint(swarm_data, stream = swarm_file)
 
         print("%d particles movements completed."%(swarm_data['evals']))

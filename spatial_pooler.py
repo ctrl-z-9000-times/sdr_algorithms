@@ -92,7 +92,7 @@ class SpatialPooler:
             permanence_thresh      = permanence_thresh,
             initial_potential_pool = self.potential_pool,)
 
-        if True:
+        if init_dist == (0, 0):
             # Nupic's SP init method
             # TODO: Make this a permanent part of the synapses class?  
             # Change init_dist argument to accept a string 'sp' ?

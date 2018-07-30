@@ -538,6 +538,7 @@ class SynapseManager:
             np.ndarray[object] sources2      = self.postsynaptic_source_side_index
             np.ndarray[object] permanences   = self.postsynaptic_permanences
             np.ndarray[INDEX_t] sources_sizes = self.postsynaptic_sources_sizes
+            np.ndarray[INDEX_t] con_counts   = self.postsynaptic_connected_count
             np.ndarray[object] presyn_perms  = getattr(self, 'presynaptic_permanences', None)
             np.ndarray[object] sinks         = self.presynaptic_sinks
             np.ndarray[object] sinks2        = self.presynaptic_sink_side_index
@@ -722,6 +723,7 @@ class SynapseManager:
                         inp_idx2,
                         sinks_parts[inp_idx1])
                     sinks_parts[inp_idx1] += 1
+                    con_counts[out_idx] += 1
 
     @cython.profile(DEBUG)
     def rebuild_indexes(self):
@@ -811,7 +813,6 @@ class SynapseManager:
         self.postsynaptic_connected_count   = con_counts
         if self.weighted:
             self.presynaptic_permanences    = sink_perms
-
 
     @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
     @cython.wraparound(False)  # Turns off negative index wrapping for entire function.
@@ -1063,8 +1064,9 @@ class SynapseManager:
             assert(sources1_inner.dtype == INDEX)
             assert(sources2_inner.dtype == INDEX)
             assert(permanences.dtype == PERMANENCE)
-            assert(np.all(permanences[ : sources_size] >= 0.))
-            assert(np.all(permanences[ : sources_size] <= 1.))
+            permanences = permanences[ : sources_size]
+            assert(np.all(permanences >= 0.))
+            assert(np.all(permanences <= 1.))
             assert(con_count == np.count_nonzero(permanences >= self.permanence_thresh))
             # Check Output -> Input linkage.
             for out_idx2 in range(sources_size):
