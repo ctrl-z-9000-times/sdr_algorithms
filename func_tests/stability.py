@@ -74,11 +74,11 @@ def measure_inter_intra_overlap(catagories, verbose = True):
     # Measure average overlap between categories.
     distinctiveness         = 0
     distinctiveness_samples = 0
-    n_combos  = len(catagories) * (len(catagories) - 1) / 2
+    n_combos  = len(list(itertools.combinations(catagories, 2)))
     subsample = int( (n_samples / n_combos) ** .5 )
     for obj1_samples, obj2_samples in itertools.combinations(catagories, 2):
-        for sdr1 in obj1_samples[ : subsample]:
-            for sdr2 in obj2_samples[ : subsample]:
+        for sdr1 in random.sample(obj1_samples, min(subsample, len(obj1_samples))):
+            for sdr2 in random.sample(obj2_samples, min(subsample, len(obj2_samples))):
                 distinctiveness         += sdr1.overlap(sdr2)
                 distinctiveness_samples += 1
     if distinctiveness_samples == 0:

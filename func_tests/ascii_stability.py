@@ -172,7 +172,7 @@ default_parameters = {
          'segments_per_cell': 22,
          'synapses_per_segment': 50},
     'tm_sdrc': {'alpha': 0.0003969982399689994},
-    'tp': {'active_thresh': -3,
+    'tp': {'active_thresh': 0,
          'boosting_alpha': 0.0003269537573903356,
          'mini_columns': 3000,
          'permanence_dec': 0.001182906466338482,
@@ -185,19 +185,13 @@ default_parameters = {
     'tp_sdrc': {'alpha': 0.0006894941776977128},
     'tp_nz_value' : 1,}
 
-if True:
-    default_parameters['tm']['cells_per_column']  = 32
-    default_parameters['tp']['potential_pool']    *= 32/20
-    # default_parameters['tm']['segments_per_cell'] = 26
-    # default_parameters['tp']['mini_columns']      = 4000
-
 def main(parameters=default_parameters, argv=None, verbose=True):
     parser = argparse.ArgumentParser()
     parser.add_argument('-t', '--time', type=int, default=20,
                         help='Number of times to run through the training data.')
     parser.add_argument('--dataset', choices=('states', 'dictionary', 'gutenberg'),
         default='states')
-    parser.add_argument('--words', type=int, default=200,
+    parser.add_argument('--words', type=int, default=500,
         help='Number of words to use.')
     parser.add_argument('--typo', type=float, default=0.,
         help='Misspell words, percentage [0-1], default 0.')
@@ -205,10 +199,13 @@ def main(parameters=default_parameters, argv=None, verbose=True):
         help='Makes the task easier by repeating words.')
     parser.add_argument('--learned_stability', action='store_true',
         help='Disable the stability mechanism during tests.')
+    parser.add_argument('--disable_tm_sdrc', action='store_true',)
     args = parser.parse_args(args = argv)
 
+    assert(parameters['tp_nz_value'] > 0)
+
     if verbose:
-        print("Parameters = ")
+        print("Parameters = ", end='')
         import pprint
         pprint.pprint(parameters)
         print("")
@@ -285,10 +282,11 @@ def main(parameters=default_parameters, argv=None, verbose=True):
         context_sdr       = SDR((parameters['tp']['mini_columns'],)),
         anomaly_alpha     = diagnostics_alpha,
         **parameters['tm'])
-    tm_sdrc = SDRClassifier(steps=[0], **parameters['tm_sdrc'])
-    tm_sdrc.compute(-1, [tm.active.size-1],    # Initialize the SDRCs internal table.
-        classification={"bucketIdx": [len(dataset)-1], "actValue": [len(dataset)-1]},
-        learn=True, infer=False)
+    if not args.disable_tm_sdrc:
+        tm_sdrc = SDRClassifier(steps=[0], **parameters['tm_sdrc'])
+        tm_sdrc.compute(-1, [tm.active.size-1],    # Initialize the SDRCs internal table.
+            classification={"bucketIdx": [len(dataset)-1], "actValue": [len(dataset)-1]},
+            learn=True, infer=False)
     tp = StableSpatialPooler(
         input_sdr         = tm.active,
         macro_columns     = (1,),
@@ -328,7 +326,7 @@ def main(parameters=default_parameters, argv=None, verbose=True):
             label = dataset[word]
         except KeyError:
             continue
-        if len(tm.learning):
+        if len(tm.learning) and not args.disable_tm_sdrc:
             tm_sdrc.compute(tm.age, tm.learning.flat_index,
                 classification={"bucketIdx": label, "actValue": label},
                 learn=True, infer=False)
@@ -370,7 +368,7 @@ def main(parameters=default_parameters, argv=None, verbose=True):
                 rand_word_tp_ovlp += sdr_a.overlap(sdr_b)
                 n_samples += 1
         rand_word_tp_ovlp /= n_samples
-        print("Novel Words, Average Overlap Within Word %g %%"%(100 * rand_word_tp_ovlp))
+        print("Novel Words (Isolated), Average Overlap Within Word %g %%"%(100 * rand_word_tp_ovlp))
 
         # Measure response to new random words, with the stability mechanism
         # turned off.
@@ -387,7 +385,7 @@ def main(parameters=default_parameters, argv=None, verbose=True):
                 rand_word_tp_ovlp_no_stab += sdr_a.overlap(sdr_b)
         rand_word_tp_ovlp_no_stab /= n_samples
         tp.stability_rate = stability_rate
-        print("Novel Words, No Stability Mechanism, Avg Ovlp Within Word %g %%"%(100 * rand_word_tp_ovlp_no_stab))
+        print("Novel Words (Isolated), No Stability Mechanism, Avg Ovlp Within Word %g %%"%(100 * rand_word_tp_ovlp_no_stab))
 
         # Compare new word response to that of randomly generated SDRs.
         rand_sdr_ovlp = 0.
@@ -423,15 +421,16 @@ def main(parameters=default_parameters, argv=None, verbose=True):
             for char in word:
                 compute(char, learn = False)
                 catagories[word].append(SDR(tp.columns))
-            try:
-                tm_inference = tm_sdrc.infer(tm.active.flat_index, None)[0]
-            except IndexError:
-                tm_inference = np.random.random(size=len(dataset))
+            if not args.disable_tm_sdrc:
+                try:
+                    tm_inference = tm_sdrc.infer(tm.active.flat_index, None)[0]
+                except IndexError:
+                    tm_inference = np.random.random(size=len(dataset))
+                tm_accuacy += word_id == np.argmax(tm_inference)
             try:
                 tp_inference = tp_sdrc.infer(tp.columns.flat_index, None)[0]
             except IndexError:
                 tp_inference = np.random.random(size=len(dataset))
-            tm_accuacy += word_id == np.argmax(tm_inference)
             tp_accuacy += word_id == np.argmax(tp_inference)
             n_samples  += 1
         tm_accuacy /= n_samples
@@ -468,19 +467,20 @@ def main(parameters=default_parameters, argv=None, verbose=True):
             word_id = dataset[word]
         except KeyError:
             continue
-        try:
-            tm_inference = tm_sdrc.infer(tm.active.flat_index, None)[0]
-        except IndexError:
-            tm_inference = np.random.random(size=len(dataset))
+        if not args.disable_tm_sdrc:
+            try:
+                tm_inference = tm_sdrc.infer(tm.active.flat_index, None)[0]
+            except IndexError:
+                tm_inference = np.random.random(size=len(dataset))
+            tm_accuacy += word_id == np.argmax(tm_inference)
+            tm_confusion[word_id] += tm_inference / np.sum(tm_inference)
         try:
             tp_inference = tp_sdrc.infer(tp.columns.flat_index, None)[0]
         except IndexError:
             tp_inference = np.random.random(size=len(dataset))
-        tm_accuacy += word_id == np.argmax(tm_inference)
         tp_accuacy += word_id == np.argmax(tp_inference)
-        n_samples  += 1
-        tm_confusion[word_id] += tm_inference / np.sum(tm_inference)
         tp_confusion[word_id] += tp_inference / np.sum(tp_inference)
+        n_samples  += 1
     tm_accuacy /= n_samples
     tp_accuacy /= n_samples
     if verbose:
@@ -490,6 +490,10 @@ def main(parameters=default_parameters, argv=None, verbose=True):
     if verbose:
         print("Temporal Memory Classifier Accuracy %g %% (%d samples)"%(100 * tm_accuacy, n_samples))
         print("Temporal Pooler Classifier Accuracy %g %% (%d samples)"%(100 * tp_accuacy, n_samples))
+
+    score = (stability * tm_accuacy * tp_accuacy)
+    if verbose:
+        print("Score: %g"%score)
 
     # Display Confusion Matixes
     if verbose:
@@ -519,6 +523,7 @@ def main(parameters=default_parameters, argv=None, verbose=True):
         anomaly_hist    = []
         stability_hist  = []
         tp_active_hist  = []
+        tp_class_hist   = []
         tp_prev_active  = SDR(tp.columns.dimensions)
         n_samples       = 0
         sample_data     = testing_data[ : 100]
@@ -531,9 +536,14 @@ def main(parameters=default_parameters, argv=None, verbose=True):
 
             for index, char in enumerate(mutated_word):
                 compute(char, learn = False)
-                sentance.append(char)
+                try:
+                    tp_inference = np.argmax(tp_sdrc.infer(tp.columns.flat_index, None)[0])
+                except IndexError:
+                    tp_inference = random.choice(range(len(dataset)))
+                tp_class_hist.append(tp_inference)
                 if index == 0:
                     boundries.append(n_samples)
+                sentance.append(char)
                 anomaly_hist.append(tm.anomaly)
                 tp_active_hist.append(SDR(tp.columns))
                 stability_hist.append(tp.columns.overlap(tp_prev_active))
@@ -547,14 +557,23 @@ def main(parameters=default_parameters, argv=None, verbose=True):
                  # np.arange(n_samples)+.5, stability_hist, 'b-',
                  np.arange(n_samples)+.5, stability_weighted, 'b-',)
         for idx, char in enumerate(sentance):
-            plt.text(idx + .5, -.04, char, horizontalalignment='center')
+            plt.text(idx + .5, .01, char, horizontalalignment='center')
         for x in boundries:
             plt.axvline(x, color='k')
-        figure_title = "ASCII Stability"
+        sorted_dataset = sorted(dataset)
+        for idx, word_id in enumerate(tp_class_hist):
+            word = sorted_dataset[word_id]
+            plt.text(idx + .5, 1., word,
+                rotation            = 90,
+                horizontalalignment = 'center',
+                verticalalignment   = 'top',)
+        figure_title = "Output Layer Stability"
         if args.learned_stability:
             figure_title += " - Stability Mechanism Disabled."
-        figure_title += "\nLines are word boundries."
+        figure_title += "\nInput character at bottom, Classification at top, Vertical lines are word boundries."
         plt.title(figure_title)
+        plt.ylabel('Stability')
+        plt.xlabel('Time step')
         plt.show()
 
     if synapses_debug:
@@ -563,9 +582,6 @@ def main(parameters=default_parameters, argv=None, verbose=True):
         tp.synapses.check_data_integrity()
         print("Synapse data structure integrity is OK.")
 
-    score = (stability * tm_accuacy * tp_accuacy)
-    if verbose:
-        print("Score: %g"%score)
     return score
 
 if __name__ == '__main__':
