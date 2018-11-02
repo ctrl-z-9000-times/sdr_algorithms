@@ -74,11 +74,10 @@ their journel and then the ".log" file is deleted.
 
 # TODO: Log files should have memory usage ...
 
-# TODO: There is a different significance test for single samples.
-
 import argparse
 import os
 import sys
+import shutil
 import random
 import pprint
 import time
@@ -92,6 +91,7 @@ import re
 import hashlib
 import numpy as np
 import scipy
+import math
 
 
 class ParameterSet(dict):
@@ -271,6 +271,8 @@ class ExperimentSummary:
             return float('nan')
         if not self.scores or not null_experiment.scores:
             return float('nan')
+        if len(self.scores) == 1:
+            pass # TODO: How to pass probabilities & statistics?
         stat, pval = scipy.stats.ttest_ind(
             null_experiment.scores, self.scores, axis=None,
             # Since both samples come from the same experimential setup  they
@@ -305,6 +307,8 @@ class ExperimentSummary:
         return self._hash
 
 
+# TODO: Special attribute for default experiment would be useful, saves me from
+# needdint to do a lookup every time...
 class LabReport:
     """
     Attributes:
@@ -320,12 +324,13 @@ class LabReport:
     """
     default_extension = '_ae'
     section_divider = '\n' + ('=' * 80) + '\n'
-    def __init__(self, experiment_argv, method=None, tag=''):
+    def __init__(self, experiment_argv, method=None, tag='', verbose=False):
         if isinstance(experiment_argv, str):
             experiment_argv = experiment_argv.split()
-        self.argv   = experiment_argv
-        self.method = method
-        self.tag    = tag
+        self.argv    = experiment_argv
+        self.method  = method
+        self.tag     = tag
+        self.verbose = verbose
         self.load_experiment_module(experiment_argv[0])
         self.ae_directory = os.path.join(self.path, self.name) + self.default_extension
         if self.tag:
@@ -342,7 +347,11 @@ class LabReport:
             # to file.
             self.init_header()
             os.mkdir(self.ae_directory)
+        # Always have an experiment for the default parameters.
+        try:
             ExperimentSummary(self,  parameters = self.default_parameters)
+        except ValueError:
+            pass
 
         # Parse & Write this file immediately at start up.
         self.save()
@@ -390,7 +399,7 @@ class LabReport:
                     self.default_parameters = file_defaults
                     break
                 elif q == 'new':
-                    os.rename(self.lab_report, self.lab_report + '.backup_defaults')
+                    shutil.copy(self.lab_report, self.lab_report + '.backup_defaults')
                     break
                 elif q == 'abort':
                     sys.exit()
@@ -403,7 +412,7 @@ class LabReport:
                     self.argv = cli
                     break
                 elif q == 'new':
-                    os.rename(self.lab_report, self.lab_report + '.backup_argv')
+                    shutil.copy(self.lab_report, self.lab_report + '.backup_argv')
                     break
                 elif q == 'abort':
                     sys.exit()
@@ -417,7 +426,7 @@ class LabReport:
         ex = sorted(self.experiments, key = lambda x: -x.mean())
         ex = ex[:20]
         s = '    Hash |   N |      Score |   P-Value | Modifications\n'
-        fmt = '%08X | %3d | % 10g | % 9.3g | '
+        fmt = '%8X | %3d | % 10g | % 9.3g | '
         for x in ex:
             s += fmt%(hash(x), len(x.scores), x.mean(), x.significance())
             if not x.modifications:
@@ -426,7 +435,7 @@ class LabReport:
                 for idx, mod in enumerate(x.modifications):
                     param, value = mod
                     if idx > 0:
-                        s += ' ' * 40
+                        s += ' ' * 42
                     s += '%s = %s\n'%(param, str(value))
         return s
 
@@ -440,8 +449,8 @@ class LabReport:
         s += self.section_divider
         s += self.significant_experiments_table().rstrip()
         s += '\n\nFailed Experiments: '
-        for x in  self.experiments:
-            if x.attempts < len(x.scores):
+        for x in self.experiments:
+            if x.attempts > len(x.scores):
                 s += '%X '%hash(x)
         s += self.section_divider
         s += self.section_divider.join(str(s) for s in self.experiments)
@@ -540,10 +549,11 @@ class LabReport:
             signal.alarm(time_limit)
 
         eval_str = (self.module_reload + 
-            'score = %s.main(parameters=%s, argv=[%s], verbose=False)'%(
+            'score = %s.main(parameters=%s, argv=[%s], verbose=%s)'%(
                 self.name,
                 repr(parameters),
-                ', '.join(repr(arg) for arg in self.argv[1:]),))
+                ', '.join(repr(arg) for arg in self.argv[1:]),
+                str(self.verbose)))
         exec_globals = {}
         exec(eval_str, exec_globals)
 
@@ -673,6 +683,7 @@ def evaluate_all(self):
 class GridSearch(object):
     """docstring for GridSearch"""
     mod_funcs = [
+        lambda v: v *  .10,
         lambda v: v *  .50,
         lambda v: v *  .75,
         # lambda v: v *  .90,
@@ -681,8 +692,7 @@ class GridSearch(object):
         lambda v: v * 1.25,
         lambda v: v * 1.50,
         lambda v: v * 2.00,
-        # lambda v: v * 2.50,
-        # lambda v: v * 3.00,
+        lambda v: v * 10.00,
     ]
 
     def __init__(self, directive):
@@ -716,16 +726,79 @@ class GridSearch(object):
 
         lab.save() # Write all of the new grid-search experiments to the lab report.
 
+        # TODO: Reject experiments which have failed a few times.
+
         rnd = random.random
         return min(experiments, key=lambda x: x.attempts + rnd()).parameters
+
+
+class CombineBest:
+    def merge(self, lab, ideas):
+        """ Take several experiments and return the best combination of them. """
+        # Marshal all of the modifications together.
+        ideas  = sorted(ideas, key = lambda x: -x.mean())
+        paths  = []
+        values = []
+        for x in ideas:
+            for path, value in x.modifications:
+                if path in paths:
+                    continue # Higher scoring experiments take precedence.
+                paths.append(path)
+                values.append(value)
+        # Create or get the experiment object.
+        mods = list(zip(paths, values))
+        try:
+            return ExperimentSummary(lab, modifications=mods)
+        except ValueError:
+            # ExperimentSummary raises ValueError if it detects duplicate entry
+            # in the database.
+            params = deepcopy(lab.default_parameters)
+            for p, v in mods:
+                params.apply(p, v)
+            return lab.experiment_ids[hash(params)]
+
+    def __call__(self, lab):
+        suggest = [] # Retval accumulator
+        # Ignore all underperforming experiments.
+        null = lab.experiment_ids[hash(lab.default_parameters)]
+        ex   = [x for x in lab.experiments if x.mean() > null.mean()]
+        # For sanity: Limit to the top experiments.
+        ex = sorted(ex, key = lambda x: -x.mean())
+        ex = ex[:20]
+        # Keep trying experiments which are not yet significant.  Experiments
+        # with a single datum have a significance of NaN...
+        trymore = [x for x in ex if (x.significance() > .50 or math.isnan(x.significance()))]
+        ex = [x for x in ex if x not in trymore]
+        suggest.extend(trymore)
+        # Suggests combinations
+        import itertools
+        for ideas in itertools.combinations(ex, 2):
+            suggest.append( self.merge(lab, ideas) )
+
+        if False: # Dump the suggestions for debugging
+            for x in suggest:
+                for p, v in x.modifications:
+                    print(p , v)
+                print()
+            1/0
+        rnd = random.random
+        return min(suggest, key=lambda x: x.attempts + rnd()).parameters
 
 
 if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
 
+    arg_parser.add_argument('--parse',  action='store_true',
+        help='Parse the lab report and write it back to the same file, then exits.')
+
+    arg_parser.add_argument('--rmz', action='store_true',
+        help='Remove all experiments which have zero attempts.')
+
     arg_parser.add_argument('--default_parameters', action='store_true',)
+
     arg_parser.add_argument('--all_experiments', action='store_true',
         help='Evaluate all experiments in the lab report, don\'t start new experiments')
+
     arg_parser.add_argument('--hashes', type=str,)
 
     arg_parser.add_argument('--best', action='store_true',
@@ -733,9 +806,9 @@ if __name__ == '__main__':
 
     arg_parser.add_argument('--directive', type=str)
 
-    arg_parser.add_argument('--parse',  action='store_true',
-        help='Parse the lab report and write it back to the same file.')
+    arg_parser.add_argument('--combine', action='store_true',)
 
+    arg_parser.add_argument('--verbose', action='store_true',)
     arg_parser.add_argument('--tag', type=str,
         help='Optional string appended to the name of the AE directory.  Use tags to '
              'keep multiple variants of an experiment alive and working at the same time')
@@ -756,25 +829,47 @@ if __name__ == '__main__':
         memory_limit = int(available_memory / args.processes)
         print("Memory Limit %.2g GB per instance."%(memory_limit / giga))
 
-    if args.default_parameters:
+    if args.parse:
+        ae = LabReport(args.experiment, None, args.tag)
+        print("Lab Report written to %s"%ae.lab_report)
+        print("Exit.")
+        sys.exit(0) # All done.
+
+    elif args.rmz:
+        ae = LabReport(args.experiment, None, args.tag)
+        rm = [x for x in ae.experiments if x.attempts == 0]
+        for x in rm:
+            ae.experiments.remove(x)
+            ae.experiment_ids.pop(hash(x))
+        ae.save()
+        sys.exit(0)
+
+    elif args.default_parameters:
         method = evaluate_default_parameters
+
     elif args.all_experiments:
         method = evaluate_all
+
     elif args.hashes:
         method = EvaluateHashes(args.hashes.split(','))
+
     elif args.best:
         method = 1/0
+
     elif args.directive:
         method = GridSearch(args.directive)
-    elif args.parse:
-        method = None
+
+    elif args.combine:
+        method = CombineBest()
+
     else:
         print("Missing command line argument: what to do?")
-        sys.exit()
+        sys.exit(1)
 
-    ae = LabReport(args.experiment, method, args.tag)
-    if args.parse:
-        sys.exit()
+    ae = LabReport(args.experiment,
+        method  = method,
+        tag     = args.tag,
+        verbose = args.verbose)
 
     ae.run(
         processes    = args.processes,
